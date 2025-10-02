@@ -16,6 +16,7 @@
 #include "store/config/ble_store_config.h"
 #include "host/ble_store.h"
 #include "ble_server.h"
+#include "ble_image_transfer.h"   // already included by you ✅
 
 static const char *TAG = "BLE_TASK";
 
@@ -181,6 +182,25 @@ void ble_send_face_notification(uint32_t frame_id, uint8_t face_count,
     }
 }
 
+/**
+ * NEW: Helper you can call from your detection pipeline.
+ * It keeps your existing notification flow intact and then kicks off
+ * the chunked image transfer via the separate Image Transfer service.
+ */
+void ble_send_face_notification_and_crop(uint32_t frame_id, uint8_t face_count,
+                                         uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+                                         float confidence,
+                                         const uint8_t *rgb565, uint32_t rgb_len)
+{
+    // 1) existing metadata notification
+    ble_send_face_notification(frame_id, face_count, x, y, width, height, confidence);
+
+    // 2) image transfer (INFO notify -> chunked DATA notifies)
+    if (rgb565 && rgb_len > 0) {
+        (void)ble_img_xfer_send_rgb565(frame_id, x, y, width, height, rgb565, rgb_len);
+    }
+}
+
 // GAP event callback
 static int gap_event_cb(struct ble_gap_event *ev, void *arg)
 {
@@ -192,7 +212,9 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
             
             // Auto-enable notifications for immediate functionality
             g_notify_enabled = true;
-            
+
+            // NEW: let the image-transfer component request MTU/DLE/PHY, etc.
+            ble_img_xfer_on_connect(g_conn_handle);  // NEW
         } else {
             ESP_LOGW(TAG, "Connection failed (status %d), restarting advertising", ev->connect.status);
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -207,6 +229,10 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
         ESP_LOGI(TAG, "Client disconnected (reason %d), restarting advertising", ev->disconnect.reason);
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_notify_enabled = false;
+
+        // NEW: reset image-transfer internal state
+        ble_img_xfer_on_disconnect();  // NEW
+
         {
             struct ble_gap_adv_params advp = {0};
             advp.conn_mode = BLE_GAP_CONN_MODE_UND;
@@ -217,6 +243,15 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
         
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU updated to %u bytes", ev->mtu.value);
+        break;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:  // NEW: forward CCCD toggles so chunking can start
+        ble_img_xfer_on_subscribe(ev->subscribe.attr_handle,
+                                  ev->subscribe.cur_notify);      // NEW
+        break;
+
+    case BLE_GAP_EVENT_NOTIFY_TX:  // NEW: resume pumping image chunks when TX frees
+        ble_img_xfer_on_notify_tx();                               // NEW
         break;
         
     default:
@@ -295,6 +330,10 @@ void ble_task(void *param) {
     rc = ble_gatts_add_svcs(g_svcs);
     assert(rc == 0);
 
+    vTaskDelay(1000);
+    // NEW: register the image transfer service (separate GATT service)
+    ble_img_xfer_init();  // NEW
+
     ble_att_set_preferred_mtu(247);
 
     ble_hs_cfg.reset_cb = NULL;
@@ -306,5 +345,5 @@ void ble_task(void *param) {
 
 void ble_server_start(const char *device_name)
 {
-    xTaskCreatePinnedToCore(ble_task, "ble_task", 4096, (void*)device_name, 5, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(ble_task, "ble_task", 8192, (void*)device_name, 5, NULL, tskNO_AFFINITY);
 }

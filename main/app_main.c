@@ -29,7 +29,7 @@ void app_main(void)
     }
 
     // Detection task
-    BaseType_t ok = xTaskCreate(face_detection_task, "face_detection_task", 16384, NULL, 5, NULL);
+    BaseType_t ok = xTaskCreate(face_detection_task, "face_detection_task", 8192, NULL, 6, NULL);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create face_detection_task");
         return;
@@ -38,5 +38,7 @@ void app_main(void)
     ble_server_start("ESP-NimBLE-Server");
     ESP_LOGI("APP", "Started BLE server task.");
 
-    ESP_LOGI(TAG, "Application started successfully");
-}
+    //validate BLE server starts
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    ESP_LOGI(TAG, "Application started successfully");}

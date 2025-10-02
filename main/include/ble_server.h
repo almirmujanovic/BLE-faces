@@ -13,6 +13,12 @@ extern "C" {
 void ble_server_start(const char *device_name);
 void ble_send_face_notification(uint32_t frame_id, uint8_t face_count, 
                                 uint16_t x, uint16_t y, uint16_t width, uint16_t height, float confidence);
+// In ble_server.h - add this declaration:
+void ble_send_face_notification_and_crop(uint32_t frame_id, uint8_t face_count,
+                                         uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+                                         float confidence,
+                                         const uint8_t *rgb565, uint32_t rgb_len);
+
 #ifdef __cplusplus
 }
 #endif

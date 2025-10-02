@@ -33,8 +33,9 @@ esp_err_t init_camera(void)
 
     // Stable RGB565 capture for detection
     config.pixel_format = PIXFORMAT_RGB565;
-    config.frame_size   = FRAMESIZE_QVGA;      // 320x240 → 153600 bytes
+    config.frame_size   = FRAMESIZE_QQVGA;      // 320x240 → 153600 bytes
     config.fb_count     = 2;
+    config.jpeg_quality = 12;                  // Not used for RGB565
     config.grab_mode    = CAMERA_GRAB_LATEST;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.xclk_freq_hz = 10000000;            // start at 10 MHz; raise to 20 MHz after stable

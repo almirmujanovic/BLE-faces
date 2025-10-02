@@ -4,6 +4,7 @@ idf_component_register(
         "camera_config.c"
         "face_detection.cpp"
         "ble_server.c"
+        "ble_image_transfer.c"
     INCLUDE_DIRS
         "." "include"
     REQUIRES
