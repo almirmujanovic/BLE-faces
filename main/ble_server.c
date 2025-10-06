@@ -16,7 +16,7 @@
 #include "store/config/ble_store_config.h"
 #include "host/ble_store.h"
 #include "ble_server.h"
-#include "ble_image_transfer.h"   // already included by you ✅
+#include "ble_image_transfer.h"   
 
 static const char *TAG = "BLE_TASK";
 
@@ -183,8 +183,8 @@ void ble_send_face_notification(uint32_t frame_id, uint8_t face_count,
 }
 
 /**
- * NEW: Helper you can call from your detection pipeline.
- * It keeps your existing notification flow intact and then kicks off
+ * NEW: Helper can be called from detection.
+ * It keeps existing notification flow intact and then kicks off
  * the chunked image transfer via the separate Image Transfer service.
  */
 void ble_send_face_notification_and_crop(uint32_t frame_id, uint8_t face_count,
@@ -213,8 +213,7 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
             // Auto-enable notifications for immediate functionality
             g_notify_enabled = true;
 
-            // NEW: let the image-transfer component request MTU/DLE/PHY, etc.
-            ble_img_xfer_on_connect(g_conn_handle);  // NEW
+            ble_img_xfer_on_connect(g_conn_handle);  
         } else {
             ESP_LOGW(TAG, "Connection failed (status %d), restarting advertising", ev->connect.status);
             g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -230,8 +229,8 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_notify_enabled = false;
 
-        // NEW: reset image-transfer internal state
-        ble_img_xfer_on_disconnect();  // NEW
+        // reset image-transfer internal state
+        ble_img_xfer_on_disconnect(); 
 
         {
             struct ble_gap_adv_params advp = {0};
@@ -245,13 +244,13 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
         ESP_LOGI(TAG, "MTU updated to %u bytes", ev->mtu.value);
         break;
 
-    case BLE_GAP_EVENT_SUBSCRIBE:  // NEW: forward CCCD toggles so chunking can start
+    case BLE_GAP_EVENT_SUBSCRIBE:  // forward CCCD toggles so chunking can start
         ble_img_xfer_on_subscribe(ev->subscribe.attr_handle,
-                                  ev->subscribe.cur_notify);      // NEW
+                                  ev->subscribe.cur_notify);      
         break;
 
-    case BLE_GAP_EVENT_NOTIFY_TX:  // NEW: resume pumping image chunks when TX frees
-        ble_img_xfer_on_notify_tx();                               // NEW
+    case BLE_GAP_EVENT_NOTIFY_TX:  // resume pumping image chunks when TX frees
+        ble_img_xfer_on_notify_tx();                               
         break;
         
     default:
@@ -331,8 +330,8 @@ void ble_task(void *param) {
     assert(rc == 0);
 
     vTaskDelay(1000);
-    // NEW: register the image transfer service (separate GATT service)
-    ble_img_xfer_init();  // NEW
+    // register the image transfer service (separate GATT service)
+    ble_img_xfer_init();  
 
     ble_att_set_preferred_mtu(247);
 
