@@ -167,6 +167,6 @@ async def run(addr=None, name_hint="ESP-Face-Detector"):
 
 if __name__ == "__main__":
     # Optional: specify exact MAC address if you know it
-    asyncio.run(run("74:4D:BD:89:2C:92"))
+    #asyncio.run(run("74:4D:BD:89:2C:92"))
     # Or scan for device:
-    # asyncio.run(run())
+     asyncio.run(run())

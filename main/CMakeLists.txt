@@ -5,6 +5,9 @@ idf_component_register(
         "face_detection.cpp"
         "ble_server.c"
         "ble_image_transfer.c"
+        "gesture.c"
+        "ble_hid.c"
+        "ble_gatts_utils.c"
     INCLUDE_DIRS
         "." "include"
     REQUIRES

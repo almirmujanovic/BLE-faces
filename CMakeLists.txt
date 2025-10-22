@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-set(PARTITION_TABLE_CSV_PATH ${CMAKE_CURRENT_SOURCE_DIR}/partitions_8mb.csv)
+set(PARTITION_TABLE_CSV_PATH ${CMAKE_CURRENT_SOURCE_DIR}/partitions.csv)
 
 # Enable C++ standard library
 set(CMAKE_CXX_STANDARD 17)

@@ -9,6 +9,7 @@
 #include "host/ble_gatt.h"
 #include "host/ble_gap.h"
 #include "os/os_mbuf.h"
+#include "ble_gatts_utils.h"
 
 static const char *TAG = "IMG_XFER";
 
@@ -59,6 +60,7 @@ static int img_data_access(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt, void *arg);
 
 // Service definition
+/*
 static const struct ble_gatt_svc_def img_svc[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -74,12 +76,28 @@ static const struct ble_gatt_svc_def img_svc[] = {
                 .access_cb = img_info_access,
                 .flags = BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &h_tx_info,
+                .descriptors = (struct ble_gatt_dsc_def[]) {
+                   {
+                       .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
+                       .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+                       .access_cb = img_info_access,
+                   },
+                   { 0 }
+               },
             },
             {
                 .uuid = &img_data_uuid.u,
                 .access_cb = img_data_access,
                 .flags = BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &h_tx_data,
+                .descriptors = (struct ble_gatt_dsc_def[]) {
+                   {
+                       .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
+                       .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+                       .access_cb = img_data_access,
+                   },
+                   { 0 }
+               },
             },
             {
                 0,
@@ -89,6 +107,53 @@ static const struct ble_gatt_svc_def img_svc[] = {
     {
         0,
     },
+};
+*/
+const struct ble_gatt_dsc_def img_info_descs[] = {
+    {
+        .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
+        .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+        .access_cb = img_info_access,
+    },
+    { 0 }
+};
+const struct ble_gatt_dsc_def img_data_descs[] = {
+    {
+        .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
+        .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+        .access_cb = img_data_access,
+    },
+    { 0 }
+};
+const struct ble_gatt_chr_def img_chrs[] = {
+    {
+        .uuid = &img_rx_uuid.u,
+        .access_cb = img_rx_access,
+        .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+    },
+    {
+        .uuid = &img_info_uuid.u,
+        .access_cb = img_info_access,
+        .flags = BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &h_tx_info,
+        .descriptors = img_info_descs,
+    },
+    {
+        .uuid = &img_data_uuid.u,
+        .access_cb = img_data_access,
+        .flags = BLE_GATT_CHR_F_NOTIFY,
+        .val_handle = &h_tx_data,
+        .descriptors = img_data_descs,
+    },
+    { 0 }
+};
+const struct ble_gatt_svc_def img_svc[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &img_svc_uuid.u,
+        .characteristics = img_chrs,
+    },
+    { 0 }
 };
 
 // Access callbacks 
@@ -104,15 +169,48 @@ static int img_rx_access(uint16_t conn_handle, uint16_t attr_handle,
     }
 }
 
+// Update access callbacks to handle CCCD operations
 static int img_info_access(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    // Handle CCCD writes
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
+        if (OS_MBUF_PKTLEN(ctxt->om) == 2) {
+            uint16_t flags = ctxt->om->om_data[0] | (ctxt->om->om_data[1] << 8);
+            g_info_ntf = (flags & 0x0001) != 0;
+            ESP_LOGI(TAG, "INFO CCCD: %s", g_info_ntf ? "ENABLED" : "DISABLED");
+        }
+        return 0;
+    }
+    
+    // Handle CCCD reads
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC) {
+        uint16_t flags = g_info_ntf ? 0x0001 : 0x0000;
+        return os_mbuf_append(ctxt->om, &flags, sizeof(flags));
+    }
+    
     return BLE_ATT_ERR_UNLIKELY;
 }
 
 static int img_data_access(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    // Handle CCCD writes
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
+        if (OS_MBUF_PKTLEN(ctxt->om) == 2) {
+            uint16_t flags = ctxt->om->om_data[0] | (ctxt->om->om_data[1] << 8);
+            g_data_ntf = (flags & 0x0001) != 0;
+            ESP_LOGI(TAG, "DATA CCCD: %s", g_data_ntf ? "ENABLED" : "DISABLED");
+        }
+        return 0;
+    }
+    
+    // Handle CCCD reads
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC) {
+        uint16_t flags = g_data_ntf ? 0x0001 : 0x0000;
+        return os_mbuf_append(ctxt->om, &flags, sizeof(flags));
+    }
+    
     return BLE_ATT_ERR_UNLIKELY;
 }
 
@@ -174,7 +272,7 @@ static void pump_task(void *pvParameters)
                         break;
                     }
                     
-                    int rc = ble_gattc_notify_custom(g_conn, h_tx_data, om);
+                    int rc = ble_gatts_notify_custom(g_conn, h_tx_data, om);
                     if (rc == 0) {
                         g_transfer.sent += to_send;
                         ESP_LOGD(TAG, "Sent chunk: %lu/%lu bytes", g_transfer.sent, g_transfer.total_len);
@@ -309,7 +407,7 @@ bool ble_img_xfer_send_frame(const ble_img_info_t *info,
         return false;
     }
     
-    int rc = ble_gattc_notify_custom(g_conn, h_tx_info, om);
+    int rc = ble_gatts_notify_custom(g_conn, h_tx_info, om);
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to send INFO: %d", rc);
         os_mbuf_free_chain(om);
@@ -336,6 +434,19 @@ bool ble_img_xfer_send_frame(const ble_img_info_t *info,
     }
     
     return true;
+}
+
+void ble_img_xfer_resolve_handles(void)
+{
+    int rc = ble_gatts_find_chr(&img_svc_uuid.u, &img_info_uuid.u, NULL, &h_tx_info);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to find INFO characteristic: %d", rc);
+    }
+    rc = ble_gatts_find_chr(&img_svc_uuid.u, &img_data_uuid.u, NULL, &h_tx_data);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to find DATA characteristic: %d", rc);
+    }
+    ESP_LOGI(TAG, "Resolved handles: INFO=0x%04x, DATA=0x%04x", h_tx_info, h_tx_data);
 }
 
 bool ble_img_xfer_send_rgb565(uint32_t frame_id,

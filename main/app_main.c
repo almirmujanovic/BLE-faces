@@ -11,6 +11,7 @@
 #include "include/face_detection.h"
 #include "include/ble_server.h"
 #include "include/ble_image_transfer.h"
+#include "include/gesture.h"
 
 static const char *TAG = "BLE_FACES";
 
@@ -259,6 +260,12 @@ void app_main(void)
         return;
     }
 
+    ESP_LOGI(TAG, "Starting BLE server...");
+    ble_server_start("ESP-Face-Detector");
+    
+    // Wait for BLE server to initialize
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
     // Initialize face detection
     ESP_LOGI(TAG, "Initializing face detection...");
     ret = init_face_detection();
@@ -299,11 +306,21 @@ void app_main(void)
     log_memory_usage("AFTER_IMG_TASK");
 
     // Start BLE server
-    ESP_LOGI(TAG, "Starting BLE server...");
-    ble_server_start("ESP-Face-Detector");
-    
-    // Wait for BLE server to initialize
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    // Initialize gesture sensor AFTER BLE is ready
+    ESP_LOGI(TAG, "Initializing gesture sensor...");
+    ret = paj7620_i2c_init();
+    if (ret == ESP_OK) {
+        ret = paj7620_init();
+        if (ret == ESP_OK) {
+            paj7620_set_high_rate(true); // Fast detection mode
+            xTaskCreate(paj7620_task, "gesture_task", 4096, NULL, 5, NULL);
+            ESP_LOGI(TAG, "Gesture sensor initialized successfully");
+        } else {
+            ESP_LOGW(TAG, "Gesture sensor init failed, continuing without gestures");
+        }
+    } else {
+        ESP_LOGW(TAG, "Gesture I2C init failed, continuing without gestures");
+    }
     
     log_memory_usage("APP_COMPLETE");
     ESP_LOGI(TAG, "=== Application started successfully ===");

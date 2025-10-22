@@ -4,22 +4,34 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_bt.h"
-
+#include "store/config/ble_store_config.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
 #include "host/ble_gap.h"
+
+#ifndef BLE_GAP_APPEARANCE_HID_GENERIC
+#define BLE_GAP_APPEARANCE_HID_GENERIC 0x03C0
+#endif
 #include "host/ble_gatt.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
-#include "store/config/ble_store_config.h"
 #include "host/ble_store.h"
+
 #include "ble_server.h"
 #include "ble_image_transfer.h"   
+#include "ble_hid.h"
+#include "ble_gatts_utils.h"
+extern void ble_store_config_init(void);
 
 static const char *TAG = "BLE_TASK";
 
+static void start_advertising(void);
+static int gap_event_cb(struct ble_gap_event *ev, void *arg);
+static void on_reset(int reason);
+static void on_sync(void);
+static void host_task(void *param);
 // Connection tracking
 static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static bool g_notify_enabled = false;
@@ -100,6 +112,9 @@ static int face_notify_desc_cb(uint16_t conn_handle, uint16_t attr_handle,
     return BLE_ATT_ERR_UNLIKELY;
 }
 
+// wipe bonds
+
+
 // UUIDs
 static const ble_uuid128_t SVC_UUID =
     BLE_UUID128_INIT(0xf0,0xde,0xac,0xbe,0x00,0x00,0x40,0x00,0x80,0x00,0x00,0xaa,0x00,0x00,0xfa,0x10);
@@ -109,6 +124,16 @@ static const ble_uuid128_t FACE_NOTIFY_UUID =
     BLE_UUID128_INIT(0xf0,0xde,0xac,0xbe,0x00,0x00,0x40,0x00,0x80,0x00,0x00,0xaa,0x00,0x02,0xfa,0x10);
 
 // GATT characteristics
+// --- In your BLE server file (not function-local) ---
+static const struct ble_gatt_dsc_def face_notify_descs[] = {
+    {
+        .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
+        .access_cb = face_notify_desc_cb,
+        .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+    },
+    { 0 }
+};
+
 static const struct ble_gatt_chr_def g_chrs[] = {
     {
         .uuid = &CHR_UUID.u,
@@ -121,18 +146,12 @@ static const struct ble_gatt_chr_def g_chrs[] = {
         .access_cb = face_notify_access_cb,
         .val_handle = &g_face_notify_handle,
         .flags = BLE_GATT_CHR_F_NOTIFY,
-        .descriptors = (struct ble_gatt_dsc_def[]) {
-            {
-                .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
-                .access_cb = face_notify_desc_cb,
-                .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
-            },
-            { 0 }
-        }
+        .descriptors = face_notify_descs,
     },
     { 0 }
 };
 
+// Define the GATT service table
 static const struct ble_gatt_svc_def g_svcs[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
@@ -141,6 +160,7 @@ static const struct ble_gatt_svc_def g_svcs[] = {
     },
     { 0 }
 };
+
 
 // Send face detection notification to connected client
 void ble_send_face_notification(uint32_t frame_id, uint8_t face_count, 
@@ -208,45 +228,60 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (ev->connect.status == 0) {
             g_conn_handle = ev->connect.conn_handle;
-            ESP_LOGI(TAG, "Client connected (handle %u)", ev->connect.conn_handle);
-            
-            // Auto-enable notifications for immediate functionality
-            g_notify_enabled = true;
+            ESP_LOGI(TAG, "Connected, handle=%u", g_conn_handle);
 
-            ble_img_xfer_on_connect(g_conn_handle);  
+            // Set connection handles for both services
+            ble_hid_set_conn(g_conn_handle);
+            ble_img_xfer_on_connect(g_conn_handle);
+
+            // Initiate security for iOS pairing
+            ESP_LOGI(TAG, "Initiating security to force pairing...");
+            if (ble_gap_security_initiate(g_conn_handle) != 0) {
+                ESP_LOGW(TAG, "Security initiate failed");
+            }
         } else {
-            ESP_LOGW(TAG, "Connection failed (status %d), restarting advertising", ev->connect.status);
-            g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-            struct ble_gap_adv_params advp = {0};
-            advp.conn_mode = BLE_GAP_CONN_MODE_UND;
-            advp.disc_mode = BLE_GAP_DISC_MODE_GEN;
-            ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER, &advp, gap_event_cb, NULL);
+            ESP_LOGE(TAG, "Connection failed; status=%d", ev->connect.status);
+            start_advertising();
         }
         break;
         
-    case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "Client disconnected (reason %d), restarting advertising", ev->disconnect.reason);
+     case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "Disconnected; reason=%d", ev->disconnect.reason);
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        g_notify_enabled = false;
-
-        // reset image-transfer internal state
-        ble_img_xfer_on_disconnect(); 
-
-        {
-            struct ble_gap_adv_params advp = {0};
-            advp.conn_mode = BLE_GAP_CONN_MODE_UND;
-            advp.disc_mode = BLE_GAP_DISC_MODE_GEN;
-            ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER, &advp, gap_event_cb, NULL);
-        }
+        ble_img_xfer_on_disconnect();
+        start_advertising();
         break;
         
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU updated to %u bytes", ev->mtu.value);
         break;
 
-    case BLE_GAP_EVENT_SUBSCRIBE:  // forward CCCD toggles so chunking can start
-        ble_img_xfer_on_subscribe(ev->subscribe.attr_handle,
-                                  ev->subscribe.cur_notify);      
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        ESP_LOGI(TAG, "SUBSCRIBE: handle=%u cur=%d prev=%d reason=%d",
+                 ev->subscribe.attr_handle,
+                 ev->subscribe.cur_notify,
+                 ev->subscribe.prev_notify,
+                 ev->subscribe.reason);
+        
+            // HID
+        ble_hid_check_cccd_subscribe(ev->subscribe.attr_handle, ev->subscribe.cur_notify);
+
+        // Image Xfer (INFO/DATA)
+        ble_img_xfer_on_subscribe(ev->subscribe.attr_handle, ev->subscribe.cur_notify);
+
+        // Face notify CCCD (value handle + 1 is CCCD)
+        if (ev->subscribe.attr_handle == (uint16_t)(g_face_notify_handle + 1)) {
+            g_notify_enabled = (ev->subscribe.cur_notify != 0);
+            ESP_LOGI(TAG, "FACE notify %s", g_notify_enabled ? "ENABLED" : "DISABLED");
+        }
+        break;
+
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        if (ev->enc_change.status == 0) {
+            ESP_LOGI(TAG, "🔐 Successfully paired and encrypted!");
+        } else {
+            ESP_LOGW(TAG, "Encryption change failed: %d", ev->enc_change.status);
+        }
         break;
 
     case BLE_GAP_EVENT_NOTIFY_TX:  // resume pumping image chunks when TX frees
@@ -262,26 +297,49 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
 static void start_advertising(void)
 {
     struct ble_gap_adv_params adv_params;
-    struct ble_hs_adv_fields fields;
+    struct ble_hs_adv_fields adv;   // primary advertising data
+    struct ble_hs_adv_fields rsp;   // scan response data
     int rc;
 
-    memset(&fields, 0, sizeof(fields));
-    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-    fields.name = (uint8_t *)"ESP-Face-Detector";
-    fields.name_len = strlen("ESP-Face-Detector");
-    fields.name_is_complete = 1;
+    // --- Primary ADV packet: flags + tx power + appearance + HID service UUID ---
+    memset(&adv, 0, sizeof(adv));
+    adv.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    adv.tx_pwr_lvl_is_present = 1;
+    adv.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
 
-    rc = ble_gap_adv_set_fields(&fields);
+    // GAP Appearance: HID Generic (you can swap to KEYBOARD/MOUSE if you prefer)
+    adv.appearance = BLE_GAP_APPEARANCE_HID_GENERIC;   // 0x03C0
+    adv.appearance_is_present = 1;
+
+    // Include HID service UUID (0x1812) in the adv (lets iOS classify you as HID)
+    static const ble_uuid16_t hid_uuid16 = BLE_UUID16_INIT(0x1812);
+    adv.uuids16 = (ble_uuid16_t *)&hid_uuid16;
+    adv.num_uuids16 = 1;
+    adv.uuids16_is_complete = 1;
+
+    rc = ble_gap_adv_set_fields(&adv);
     if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to set advertising fields: %d", rc);
+        ESP_LOGE(TAG, "Failed to set ADV fields: %d", rc);
         return;
     }
 
+    // --- Scan Response: put the (long) device name here so it won't get truncated ---
+    memset(&rsp, 0, sizeof(rsp));
+    const char *name = "ESP-Face-Detector";
+    rsp.name = (uint8_t *)name;
+    rsp.name_len = strlen(name);
+    rsp.name_is_complete = 1;
+
+    rc = ble_gap_adv_rsp_set_fields(&rsp);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "Failed to set scan response fields: %d", rc);
+        return;
+    }
+
+    // --- Params and start ---
     memset(&adv_params, 0, sizeof(adv_params));
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;   // connectable undirected
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;   // general discoverable
     adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
     adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
 
@@ -292,18 +350,98 @@ static void start_advertising(void)
         return;
     }
 
-    ESP_LOGI(TAG, "BLE advertising started");
+    ESP_LOGI(TAG, "BLE advertising started (HID appearance + 0x1812 in ADV, name in scan response)");
+}
+
+
+static void on_reset(int reason)
+{
+    ESP_LOGW(TAG, "BLE host reset, reason: %d", reason);
 }
 
 static void on_sync(void)
 {
-    int rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
+    // Start all registered GATT services once, from on_sync
+    int rc = ble_gatts_start();
     if (rc != 0) {
-        ESP_LOGE(TAG, "Failed to infer address type: %d", rc);
+        ESP_LOGE(TAG, "ble_gatts_start rc=%d", rc);
         return;
     }
+    ESP_LOGI(TAG, "All GATT services started");
+
+    // Now that services are started, resolve handles
+    ble_img_xfer_resolve_handles();      // INFO/DATA handles
+    ESP_ERROR_CHECK(ble_hid_get_handles()); // HID value/CCCD handles
+
+    // Set preferred MTU (optional, here is fine)
+    ble_att_set_preferred_mtu(247);
+
+
+
+    uint8_t own_addr_type;
+    rc = ble_hs_id_infer_auto(0, &own_addr_type);
+    if (rc != 0) { ESP_LOGE(TAG, "infer addr type rc=%d", rc); return; }
+    g_own_addr_type = own_addr_type;           // keep this global
+    // Optional but nice: log the address we’re using.
+    // Get and log our BLE address
+    uint8_t addr_val[6];
+    rc = ble_hs_id_copy_addr(g_own_addr_type, addr_val, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_id_copy_addr rc=%d", rc);
+        return;
+    }
+    ESP_LOGI(TAG, "Using addr type=%u %02X:%02X:%02X:%02X:%02X:%02X",
+            g_own_addr_type,
+            addr_val[5], addr_val[4], addr_val[3],
+            addr_val[2], addr_val[1], addr_val[0]);
+
     start_advertising();
 }
+
+
+// Good ble_start_all(): register everything, set callbacks. Do NOT start or resolve yet.
+static void ble_start_all(const char *device_name)
+{
+    ESP_ERROR_CHECK(nvs_flash_init());
+    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+
+    nimble_port_init();
+    ble_store_config_init();
+
+    // Configure NimBLE host callbacks BEFORE the host starts
+    ble_hs_cfg.store_status_cb = NULL;
+    ble_hs_cfg.reset_cb        = on_reset;
+    ble_hs_cfg.sync_cb         = on_sync;
+
+    // Core GAP/GATT services
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    if (device_name && *device_name) {
+        ble_svc_gap_device_name_set(device_name);
+    }
+
+    // 1) Register HID (count + add only)
+    ESP_ERROR_CHECK(ble_hid_init());
+
+    // 2) Register your FACE service (count + add only)
+    int rc = ble_gatts_count_cfg(g_svcs);
+    assert(rc == 0);
+    rc = ble_gatts_add_svcs(g_svcs);
+    assert(rc == 0);
+
+    // (optional) sanity_check_tables(...) + dump_table(...)
+
+    // 3) Register IMAGE XFER (count + add only; do not resolve yet)
+    ble_img_xfer_init();
+
+    // Do NOT call ble_gatts_start() here.
+    // Do NOT resolve handles here.
+    // Do NOT set MTU here.
+
+    // Start the NimBLE host task; on_sync() will run shortly.
+    nimble_port_freertos_init(host_task);
+}
+
 
 static void host_task(void *param)
 {
@@ -311,6 +449,7 @@ static void host_task(void *param)
     nimble_port_freertos_deinit();
 }
 
+/*
 void ble_task(void *param) {
     const char *device_name = (const char *)param;
 
@@ -341,7 +480,14 @@ void ble_task(void *param) {
     nimble_port_freertos_init(host_task);
     vTaskDelete(NULL);
 }
+*/
 
+void ble_task(void *param){
+    const char *device_name = (const char*) param;
+    ble_start_all(device_name);
+    //nimble_port_freertos_init(host_task);
+    vTaskDelete(NULL);
+}
 void ble_server_start(const char *device_name)
 {
     xTaskCreatePinnedToCore(ble_task, "ble_task", 8192, (void*)device_name, 5, NULL, tskNO_AFFINITY);

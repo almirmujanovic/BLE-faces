@@ -18,6 +18,7 @@ void ble_send_face_notification_and_crop(uint32_t frame_id, uint8_t face_count,
                                          uint16_t x, uint16_t y, uint16_t width, uint16_t height,
                                          float confidence,
                                          const uint8_t *rgb565, uint32_t rgb_len);
+extern const struct ble_gatt_svc_def img_svc[]; 
 
 #ifdef __cplusplus
 }

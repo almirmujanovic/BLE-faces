@@ -6,3 +6,8 @@ dependencies.lock
 sdkconfig
 sdkconfig.defaults
 sdkconfig.ci
+# Ignore everything in the folder
+client/*
+
+# But not this specific file
+!folder/ble_client.py
