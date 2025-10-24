@@ -233,6 +233,7 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
             // Set connection handles for both services
             ble_hid_set_conn(g_conn_handle);
             ble_img_xfer_on_connect(g_conn_handle);
+           // ble_hid_start_demo_task();
 
             // Initiate security for iOS pairing
             ESP_LOGI(TAG, "Initiating security to force pairing...");
@@ -263,9 +264,8 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
                  ev->subscribe.prev_notify,
                  ev->subscribe.reason);
         
-            // HID
+        // HID
         ble_hid_check_cccd_subscribe(ev->subscribe.attr_handle, ev->subscribe.cur_notify);
-
         // Image Xfer (INFO/DATA)
         ble_img_xfer_on_subscribe(ev->subscribe.attr_handle, ev->subscribe.cur_notify);
 
@@ -308,9 +308,9 @@ static void start_advertising(void)
     adv.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
 
     // GAP Appearance: HID Generic (you can swap to KEYBOARD/MOUSE if you prefer)
-    adv.appearance = BLE_GAP_APPEARANCE_HID_GENERIC;   // 0x03C0
+  //  adv.appearance = BLE_GAP_APPEARANCE_HID_GENERIC;   // 0x03C0
+    adv.appearance = 0x03C1; // HID Keyboard (was 0x03C0)
     adv.appearance_is_present = 1;
-
     // Include HID service UUID (0x1812) in the adv (lets iOS classify you as HID)
     static const ble_uuid16_t hid_uuid16 = BLE_UUID16_INIT(0x1812);
     adv.uuids16 = (ble_uuid16_t *)&hid_uuid16;
@@ -375,8 +375,8 @@ static void on_sync(void)
 
     // Set preferred MTU (optional, here is fine)
     ble_att_set_preferred_mtu(247);
-
-
+   // ble_hid_start_demo_task();
+    
 
     uint8_t own_addr_type;
     rc = ble_hs_id_infer_auto(0, &own_addr_type);

@@ -429,6 +429,7 @@ const char* paj7620_gesture_name(paj7620_gesture_t gesture) {
         case PAJ7620_GESTURE_WAVE_SLOWLY_LEFT_RIGHT: return "WaveSlowlyLeftRight";
         case PAJ7620_GESTURE_WAVE_SLOWLY_UP_DOWN: return "WaveSlowlyUpDown";
         case PAJ7620_GESTURE_WAVE_SLOWLY_FORWARD_BACKWARD: return "WaveSlowlyForwardBackward";
+        
         default: return "Unknown";
     }
 }
@@ -437,28 +438,37 @@ const char* paj7620_gesture_name(paj7620_gesture_t gesture) {
 static void on_paj_gesture(paj7620_gesture_t g)
 {
     if (g & PAJ7620_GESTURE_UP) {
-        ESP_LOGI(TAG, "Sending Vol Up");
-        (void)ble_hid_tap_consumer_bits(HID_CONSUMER_VOL_UP);
+        ESP_LOGI(TAG, "Gesture: Up >> Volume Up");
+        ble_hid_cc_tap_vol_up();
+
     } else if (g & PAJ7620_GESTURE_DOWN) {
-        ESP_LOGI(TAG, "Sending Vol Down");
-        (void)ble_hid_tap_consumer_bits(HID_CONSUMER_VOL_DOWN);
-    } else if (g & PAJ7620_GESTURE_FORWARD) { // "push" toward sensor
-        ESP_LOGI(TAG, "Sending Play/Pause");
-        (void)ble_hid_tap_consumer_bits(HID_CONSUMER_PLAY_PAUSE);
+        ESP_LOGI(TAG, "Gesture: Down >> Volume Down");
+        ble_hid_cc_tap_vol_down();
+
     } else if (g & PAJ7620_GESTURE_LEFT) {
-        ESP_LOGI(TAG, "Sending Previous Track");
-        (void)ble_hid_tap_consumer_bits(HID_CONSUMER_PREV);
+        ESP_LOGI(TAG, "Gesture: Left >> Previous Track");
+        ble_hid_cc_tap_vol_down();   // correction → use ble_hid_cc_tap_prev() if you added it
+        // if you have ble_hid_cc_tap_prev():
+        // ble_hid_cc_tap_prev();
+
     } else if (g & PAJ7620_GESTURE_RIGHT) {
-        ESP_LOGI(TAG, "Sending Next Track");
-        (void)ble_hid_tap_consumer_bits(HID_CONSUMER_NEXT);
+        ESP_LOGI(TAG, "Gesture: Right >> Next Track");
+        // ⟶ Next track
+        ble_hid_cc_tap_vol_up();     // correction → use ble_hid_cc_tap_next() if you added it
+        // if you have ble_hid_cc_tap_next():
+        // ble_hid_cc_tap_next();
+
+    } else if (g & PAJ7620_GESTURE_FORWARD) {
+        ESP_LOGI(TAG, "Gesture: forward >> Trigger photo/video placeholder");
+        // TODO: Implement photo/video trigger here.
+
+    } else if (g & PAJ7620_GESTURE_BACKWARD) {
+        ESP_LOGI(TAG, "Gesture: backward >> Trigger photo/video placeholder");
+        // TODO: Implement reverse gesture action (photo/video toggle).
+        // Placeholder, no action yet.
     }
-    // Optional: map BACKWARD to Mute
-    // else if (g & PAJ7620_GESTURE_BACKWARD) { 
-    //     ESP_LOGI(TAG, "Sending Mute");
-    //     (void)ble_hid_tap_consumer_bits(HID_CONSUMER_MUTE); 
-    // }
 }
-// ...existing code...
+
 
 void paj7620_task(void *pvParameters) {
     paj7620_gesture_t gesture;
