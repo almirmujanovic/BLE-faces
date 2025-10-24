@@ -1,14 +1,19 @@
 #include "ble_hid.h"
+
+#include <string.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
 #include "host/ble_gatt.h"
-
+#include "host/ble_store.h"
+extern void ble_store_config_init(void);
 // ---------- Logging ----------
 static const char *TAG = "HID_CC";
+
 
 // ---------- UUIDs ----------
 static const ble_uuid16_t UUID_HID_SVC           = BLE_UUID16_INIT(0x1812);
@@ -22,10 +27,10 @@ static const ble_uuid16_t UUID_DSC_CCCD          = BLE_UUID16_INIT(0x2902);
 static const ble_uuid16_t UUID_DSC_REPORT_REF    = BLE_UUID16_INIT(0x2908);
 
 // ---------- HID constants ----------
-#define REPORT_ID_CC  0x03
+#define REPORT_ID_CC      0x03
 #define REPORT_TYPE_INPUT 0x01
 
-// Same as your Arduino CONSUMER_REPORT_MAP: 7 bits → 1 byte payload.
+// Report map: Consumer Control with 7 buttons (1 byte payload) + 1 pad bit.
 static const uint8_t s_report_map[] = {
     0x05, 0x0C,              // Usage Page (Consumer)
     0x09, 0x01,              // Usage (Consumer Control)
@@ -49,19 +54,55 @@ static const uint8_t s_report_map[] = {
 };
 
 // HID Information: ver 1.11, country=0, flags: normally connectable
-static const uint8_t s_hid_info[4] = { 0x11, 0x01, 0x00, 0x00 };
-static uint8_t       s_proto_mode  = 0x01; // Report mode only
+// (Use 0x00 here since that was already working for you.)
+static const uint8_t s_hid_info[4] = { 0x11, 0x01, 0x00, 0x03 };
+static uint8_t       s_proto_mode  = 0x01; // Report protocol only
 
 // Report Reference (Report ID=3, Type=Input)
 static const uint8_t s_report_ref[2] = { REPORT_ID_CC, REPORT_TYPE_INPUT };
 
 // ---------- State ----------
-static uint16_t s_conn              = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t s_input_val_handle  = 0;
-static bool     s_input_notify_en   = false;
+static uint16_t s_conn             = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_input_val_handle = 0;
+static bool     s_input_notify_en  = false;
+
+// ---------- Worker/Queue to serialize HID sends ----------
+typedef enum {
+    HID_ACT_BITS,     // send 1-byte bitmap (lower 7 bits used)
+    HID_ACT_BITIDX    // send one specific bit by index (0..6)
+} hid_act_type_t;
+
+typedef struct {
+    hid_act_type_t type;
+    uint16_t bits;   // for HID_ACT_BITS
+    uint8_t  bitidx; // for HID_ACT_BITIDX
+} hid_act_t;
+
+static QueueHandle_t s_hid_q = NULL;
+static void          hid_worker(void *arg);
+
+bool ble_hid_is_ready(void) {
+    return (s_conn != BLE_HS_CONN_HANDLE_NONE) && s_input_notify_en && (s_input_val_handle != 0);
+}
+
+static void ensure_hid_worker_started(void)
+{
+    static bool started = false;
+    if (!started) {
+        s_hid_q = xQueueCreate(8, sizeof(hid_act_t));
+        if (s_hid_q) {
+            xTaskCreate(hid_worker, "hid_worker", 3072, NULL, 3, NULL);
+            started = true;
+        } else {
+            ESP_LOGE(TAG, "Failed to create HID queue");
+        }
+    }
+}
 
 // ---------- Forward ----------
-static int hid_access(uint16_t, uint16_t, struct ble_gatt_access_ctxt*, void*);
+static int  hid_access(uint16_t, uint16_t, struct ble_gatt_access_ctxt*, void*);
+static esp_err_t send_bits_immediate(uint8_t v);
+static esp_err_t cc_tap_bit_immediate(uint8_t bit_index);
 
 // ---------- Descriptors / Characteristics ----------
 static struct ble_gatt_dsc_def s_input_descs[] = {
@@ -82,7 +123,7 @@ static struct ble_gatt_chr_def s_hid_chrs[] = {
     { // Protocol Mode (Report only; allow write-no-rsp of 0x01)
       .uuid = &UUID_HID_PROTO_MODE.u, .access_cb = hid_access,
       .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP },
-    { // Control Point (Suspend/Exit Suspend; we just accept writes)
+    { // Control Point (Suspend/Exit Suspend; accept writes)
       .uuid = &UUID_HID_CTRL_POINT.u, .access_cb = hid_access,
       .flags = BLE_GATT_CHR_F_WRITE_NO_RSP },
     { 0 }
@@ -174,6 +215,10 @@ esp_err_t ble_hid_init(void)
     if (rc) { ESP_LOGE(TAG, "count_cfg rc=%d", rc); return ESP_FAIL; }
     rc = ble_gatts_add_svcs(s_hid_svcs);
     if (rc) { ESP_LOGE(TAG, "add_svcs rc=%d", rc);   return ESP_FAIL; }
+    
+    // Start the HID worker/queue (safe to start early).
+    ensure_hid_worker_started();
+
     ESP_LOGI(TAG, "HID service registered");
     return ESP_OK;
 }
@@ -200,20 +245,18 @@ void ble_hid_check_cccd_subscribe(uint16_t attr_handle, uint16_t cur_notify)
     }
 }
 
-// ---------- Send helper (1-byte payload, report ID is implied by characteristic+ReportRef) ----------
-static esp_err_t cc_tap_bit(uint8_t bit_index)
+// ---------- Internal immediate send helpers (used by worker) ----------
+static esp_err_t send_bits_immediate(uint8_t v)
 {
-    if (s_conn == BLE_HS_CONN_HANDLE_NONE)             return ESP_ERR_INVALID_STATE;
-    if (!s_input_notify_en || s_input_val_handle == 0) return ESP_ERR_INVALID_STATE;
+    if (!ble_hid_is_ready()) return ESP_ERR_INVALID_STATE;
 
     // Press
-    uint8_t v = (uint8_t)(1u << bit_index);
     struct os_mbuf *om = ble_hs_mbuf_from_flat(&v, 1);
     if (!om) return ESP_ERR_NO_MEM;
     int rc = ble_gatts_notify_custom(s_conn, s_input_val_handle, om);
     if (rc) return ESP_FAIL;
 
-    vTaskDelay(pdMS_TO_TICKS(90));
+    vTaskDelay(pdMS_TO_TICKS(60));
 
     // Release
     v = 0x00;
@@ -223,6 +266,42 @@ static esp_err_t cc_tap_bit(uint8_t bit_index)
     return rc ? ESP_FAIL : ESP_OK;
 }
 
+static esp_err_t cc_tap_bit_immediate(uint8_t bit_index)
+{
+    if (bit_index > 6) return ESP_ERR_INVALID_ARG;
+    uint8_t v = (uint8_t)(1u << bit_index);
+    return send_bits_immediate(v);
+}
+
+// ---------- Worker task (serializes and guards timing) ----------
+static void hid_worker(void *arg)
+{
+    (void)arg;
+    hid_act_t act;
+
+    for (;;) {
+        if (xQueueReceive(s_hid_q, &act, portMAX_DELAY) == pdTRUE) {
+            // Wait for connection + CCCD, but don't busy-spin forever.
+            int guard = 0;
+            while (!ble_hid_is_ready() && guard++ < 100) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+            }
+            if (!ble_hid_is_ready()) continue;
+
+            if (act.type == HID_ACT_BITIDX) {
+                (void)cc_tap_bit_immediate(act.bitidx);
+            } else {
+                uint8_t v = (uint8_t)(act.bits & 0x7F); // lower 7 bits valid
+                (void)send_bits_immediate(v);
+            }
+
+            // Small inter-action gap so multiple gestures don't coalesce on phones
+            vTaskDelay(pdMS_TO_TICKS(60));
+        }
+    }
+}
+
+// ---------- Public API (enqueue; safe from any context/task) ----------
 // Bit layout (must match s_report_map order)
 #define BIT_VOL_UP       0
 #define BIT_VOL_DOWN     1
@@ -231,104 +310,25 @@ static esp_err_t cc_tap_bit(uint8_t bit_index)
 #define BIT_NEXT         4
 #define BIT_PREV         5
 #define BIT_STOP         6
-/*
-esp_err_t ble_hid_cc_tap_vol_up(void)      { return cc_tap_bit(BIT_VOL_UP); }
-esp_err_t ble_hid_cc_tap_vol_down(void)    { return cc_tap_bit(BIT_VOL_DOWN); }
-esp_err_t ble_hid_cc_tap_play_pause(void)  { return cc_tap_bit(BIT_PLAY_PAUSE); }
 
-// Demo task (optional, for dev)
-static void demo_task(void *arg)
+esp_err_t ble_hid_tap_consumer_bits(uint16_t bits)
 {
-    (void)arg;
-    for (;;) {
-        if (s_input_notify_en && s_conn != BLE_HS_CONN_HANDLE_NONE) {
-            ble_hid_cc_tap_vol_up();     vTaskDelay(pdMS_TO_TICKS(800));
-            ble_hid_cc_tap_vol_down();   vTaskDelay(pdMS_TO_TICKS(800));
-            ble_hid_cc_tap_play_pause(); vTaskDelay(pdMS_TO_TICKS(1600));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(500));
-        }
-    }
+    if (!s_hid_q) return ESP_ERR_INVALID_STATE;
+    hid_act_t a = { .type = HID_ACT_BITS, .bits = (uint16_t)(bits & 0x7F), .bitidx = 0 };
+    return xQueueSend(s_hid_q, &a, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
 }
-void ble_hid_start_demo_task(void)
+
+static esp_err_t enqueue_bit(uint8_t idx)
 {
-    static bool started = false;
-    if (!started) {
-        xTaskCreate(demo_task, "hid_demo", 3072, NULL, 3, NULL);
-        started = true;
-    }
-}
-*/
-esp_err_t ble_hid_tap_consumer_bits(uint8_t bits)
-{
-    if (s_conn == BLE_HS_CONN_HANDLE_NONE || !s_input_notify_en || s_input_val_handle == 0) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    uint8_t v = (uint8_t)(bits & 0x7F);  // only 7 bits are valid per report map
-
-    // press
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(&v, 1);
-    if (!om) return ESP_ERR_NO_MEM;
-    int rc = ble_gatts_notify_custom(s_conn, s_input_val_handle, om);
-    if (rc) return ESP_FAIL;
-
-    vTaskDelay(pdMS_TO_TICKS(60));
-
-    // release
-    v = 0x00;
-    om = ble_hs_mbuf_from_flat(&v, 1);
-    if (!om) return ESP_ERR_NO_MEM;
-    rc = ble_gatts_notify_custom(s_conn, s_input_val_handle, om);
-    return rc ? ESP_FAIL : ESP_OK;
+    if (!s_hid_q) return ESP_ERR_INVALID_STATE;
+    hid_act_t a = { .type = HID_ACT_BITIDX, .bits = 0, .bitidx = idx };
+    return xQueueSend(s_hid_q, &a, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
 }
 
-
-/* -------------------------------------------------------------------------
- * Convenience wrappers that match the current REPORT MAP bit order
- * REPORT MAP order (16 bits):
- *  bit0:  Mute (0xE2)
- *  bit1:  Power (0x30)
- *  bit2:  Volume Up (0xE9)
- *  bit3:  Volume Down (0xEA)
- *  bit4:  Play/Pause (0xCD)
- *  bit5:  Next (0xB5)
- *  bit6:  Previous (0xB6)
- *  bit7:  Stop (0xB7)
- *  bit8:  Eject
- *  bit9:  Media Select
- *  bit10: AL Browser
- *  bit11: AL Calculator
- *  bit12: AC Bookmarks
- *  bit13: AC Search
- *  bit14: AC Home
- *  bit15: AC Back
- * ------------------------------------------------------------------------- */
-
-esp_err_t ble_hid_cc_tap_vol_up(void) {
-    return ble_hid_tap_consumer_bits((uint8_t)(1u << 2));  // Volume Up
-}
-
-esp_err_t ble_hid_cc_tap_vol_down(void) {
-    return ble_hid_tap_consumer_bits((uint8_t)(1u << 3));  // Volume Down
-}
-
-esp_err_t ble_hid_cc_tap_mute(void) {
-    return ble_hid_tap_consumer_bits((uint8_t)(1u << 0));  // Mute
-}
-
-esp_err_t ble_hid_cc_tap_play_pause(void) {
-    return ble_hid_tap_consumer_bits((uint8_t)(1u << 4));  // Play/Pause
-}
-
-esp_err_t ble_hid_cc_tap_next(void) {
-    return ble_hid_tap_consumer_bits((uint8_t)(1u << 5));  // Next Track
-}
-
-esp_err_t ble_hid_cc_tap_prev(void) {
-    return ble_hid_tap_consumer_bits((uint8_t)(1u << 6));  // Previous Track
-}
-
-esp_err_t ble_hid_cc_tap_stop(void) {
-    return ble_hid_tap_consumer_bits((uint8_t)(1u << 7));  // Stop
-}
+esp_err_t ble_hid_cc_tap_vol_up(void)      { return enqueue_bit(BIT_VOL_UP); }
+esp_err_t ble_hid_cc_tap_vol_down(void)    { return enqueue_bit(BIT_VOL_DOWN); }
+esp_err_t ble_hid_cc_tap_mute(void)        { return enqueue_bit(BIT_MUTE); }
+esp_err_t ble_hid_cc_tap_play_pause(void)  { return enqueue_bit(BIT_PLAY_PAUSE); }
+esp_err_t ble_hid_cc_tap_next(void)        { return enqueue_bit(BIT_NEXT); }
+esp_err_t ble_hid_cc_tap_prev(void)        { return enqueue_bit(BIT_PREV); }
+esp_err_t ble_hid_cc_tap_stop(void)        { return enqueue_bit(BIT_STOP); }

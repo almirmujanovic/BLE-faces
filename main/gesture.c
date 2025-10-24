@@ -434,38 +434,23 @@ const char* paj7620_gesture_name(paj7620_gesture_t gesture) {
     }
 }
 
-// Map PAJ7620 gestures to Consumer Control usage IDs
 static void on_paj_gesture(paj7620_gesture_t g)
 {
-    if (g & PAJ7620_GESTURE_UP) {
-        ESP_LOGI(TAG, "Gesture: Up >> Volume Up");
-        ble_hid_cc_tap_vol_up();
+    if (!ble_hid_is_ready()) {
+        // Not connected or CCCD not enabled yet; ignore gestures quietly
+        return;
+    }
 
-    } else if (g & PAJ7620_GESTURE_DOWN) {
-        ESP_LOGI(TAG, "Gesture: Down >> Volume Down");
-        ble_hid_cc_tap_vol_down();
-
-    } else if (g & PAJ7620_GESTURE_LEFT) {
-        ESP_LOGI(TAG, "Gesture: Left >> Previous Track");
-        ble_hid_cc_tap_vol_down();   // correction → use ble_hid_cc_tap_prev() if you added it
-        // if you have ble_hid_cc_tap_prev():
-        // ble_hid_cc_tap_prev();
-
-    } else if (g & PAJ7620_GESTURE_RIGHT) {
-        ESP_LOGI(TAG, "Gesture: Right >> Next Track");
-        // ⟶ Next track
-        ble_hid_cc_tap_vol_up();     // correction → use ble_hid_cc_tap_next() if you added it
-        // if you have ble_hid_cc_tap_next():
-        // ble_hid_cc_tap_next();
-
-    } else if (g & PAJ7620_GESTURE_FORWARD) {
-        ESP_LOGI(TAG, "Gesture: forward >> Trigger photo/video placeholder");
-        // TODO: Implement photo/video trigger here.
-
+    if (g & PAJ7620_GESTURE_UP)           (void)ble_hid_cc_tap_vol_up();
+    else if (g & PAJ7620_GESTURE_DOWN)    (void)ble_hid_cc_tap_vol_down();
+    else if (g & PAJ7620_GESTURE_LEFT)    (void)ble_hid_cc_tap_prev();
+    else if (g & PAJ7620_GESTURE_RIGHT)   (void)ble_hid_cc_tap_next();
+    else if (g & PAJ7620_GESTURE_FORWARD) {
+        // TODO: trigger PHOTO (placeholder)
+        (void)ble_hid_cc_tap_play_pause(); // or leave commented for now
     } else if (g & PAJ7620_GESTURE_BACKWARD) {
-        ESP_LOGI(TAG, "Gesture: backward >> Trigger photo/video placeholder");
-        // TODO: Implement reverse gesture action (photo/video toggle).
-        // Placeholder, no action yet.
+        // TODO: trigger VIDEO (placeholder)
+        (void)ble_hid_cc_tap_mute(); // or leave commented
     }
 }
 

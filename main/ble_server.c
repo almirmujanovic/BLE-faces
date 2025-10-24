@@ -229,7 +229,7 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
         if (ev->connect.status == 0) {
             g_conn_handle = ev->connect.conn_handle;
             ESP_LOGI(TAG, "Connected, handle=%u", g_conn_handle);
-
+            ESP_LOGI(TAG, "CONNECT status=%d handle=%u", ev->connect.status, ev->connect.conn_handle);
             // Set connection handles for both services
             ble_hid_set_conn(g_conn_handle);
             ble_img_xfer_on_connect(g_conn_handle);
@@ -242,6 +242,7 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
             }
         } else {
             ESP_LOGE(TAG, "Connection failed; status=%d", ev->connect.status);
+            ble_app_set_random_addr();
             start_advertising();
         }
         break;
@@ -250,6 +251,7 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
         ESP_LOGI(TAG, "Disconnected; reason=%d", ev->disconnect.reason);
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         ble_img_xfer_on_disconnect();
+        ESP_LOGW(TAG, "DISCONNECT reason=%d", ev->disconnect.reason);
         start_advertising();
         break;
         
@@ -263,7 +265,7 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
                  ev->subscribe.cur_notify,
                  ev->subscribe.prev_notify,
                  ev->subscribe.reason);
-        
+            ESP_LOGI(TAG, "SUBSCRIBE attr=0x%04x cur=%d", ev->subscribe.attr_handle, ev->subscribe.cur_notify);
         // HID
         ble_hid_check_cccd_subscribe(ev->subscribe.attr_handle, ev->subscribe.cur_notify);
         // Image Xfer (INFO/DATA)
@@ -413,6 +415,7 @@ static void ble_start_all(const char *device_name)
     ble_hs_cfg.reset_cb        = on_reset;
     ble_hs_cfg.sync_cb         = on_sync;
 
+    ble_app_set_random_addr();
     // Core GAP/GATT services
     ble_svc_gap_init();
     ble_svc_gatt_init();

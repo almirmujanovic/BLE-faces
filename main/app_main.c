@@ -313,8 +313,7 @@ void app_main(void)
         ret = paj7620_init();
         if (ret == ESP_OK) {
             paj7620_set_high_rate(true); // Fast detection mode
-            xTaskCreate(paj7620_task, "gesture_task", 4096, NULL, 5, NULL);
-            ESP_LOGI(TAG, "Gesture sensor initialized successfully");
+            xTaskCreatePinnedToCore(paj7620_task, "paj", 4096, NULL, 2 /*low*/, NULL, 1 /*APP core*/);            ESP_LOGI(TAG, "Gesture sensor initialized successfully");
         } else {
             ESP_LOGW(TAG, "Gesture sensor init failed, continuing without gestures");
         }
