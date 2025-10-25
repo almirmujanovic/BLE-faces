@@ -105,18 +105,18 @@ static esp_err_t send_bits_immediate(uint8_t v);
 static esp_err_t cc_tap_bit_immediate(uint8_t bit_index);
 
 // ---------- Descriptors / Characteristics ----------
-static struct ble_gatt_dsc_def s_input_descs[] = {
-    { .uuid = &UUID_DSC_CCCD.u,       .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE, .access_cb = hid_access },
+static const struct ble_gatt_dsc_def s_input_descs[] = {
+    { .uuid = &UUID_DSC_CCCD.u,       .att_flags = BLE_ATT_F_READ_ENC | BLE_ATT_F_WRITE_ENC, .access_cb = hid_access },
     { .uuid = &UUID_DSC_REPORT_REF.u, .att_flags = BLE_ATT_F_READ,                   .access_cb = hid_access },
     { 0 }
 };
 
-static struct ble_gatt_chr_def s_hid_chrs[] = {
+static const struct ble_gatt_chr_def s_hid_chrs[] = {
     { // Report Map
       .uuid = &UUID_HID_REPORT_MAP.u, .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ },
     { // Input Report (value handle stored for notify)
       .uuid = &UUID_HID_REPORT.u,     .access_cb = hid_access,
-      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+      .flags = BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
       .val_handle = &s_input_val_handle, .descriptors = s_input_descs },
     { // HID Information
       .uuid = &UUID_HID_INFO.u,       .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ },

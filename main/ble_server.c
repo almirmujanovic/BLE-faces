@@ -242,7 +242,7 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
             }
         } else {
             ESP_LOGE(TAG, "Connection failed; status=%d", ev->connect.status);
-            ble_app_set_random_addr();
+            //ble_app_set_random_addr();
             start_advertising();
         }
         break;
@@ -303,36 +303,96 @@ static void start_advertising(void)
     struct ble_hs_adv_fields rsp;   // scan response data
     int rc;
 
-    // --- Primary ADV packet: flags + tx power + appearance + HID service UUID ---
+    // --- Prepare UUID arrays that outlive this function ---
+    static const ble_uuid16_t s_uuid16_hid = BLE_UUID16_INIT(0x1812);
+    // Your image service UUID (matches ble_image_transfer.h BLE_IMG_SVC_UUID128)
+    static const ble_uuid128_t s_uuid128_img = BLE_UUID128_INIT(BLE_IMG_SVC_UUID128);
+
+    // --- Try to fit both UUIDs into the primary ADV first ---
     memset(&adv, 0, sizeof(adv));
     adv.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    adv.tx_pwr_lvl_is_present = 1;
-    adv.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+    // TX power is nice but optional; leave out to save bytes
+    // adv.tx_pwr_lvl_is_present = 1;
+    // adv.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
 
-    // GAP Appearance: HID Generic (you can swap to KEYBOARD/MOUSE if you prefer)
-  //  adv.appearance = BLE_GAP_APPEARANCE_HID_GENERIC;   // 0x03C0
-    adv.appearance = 0x03C1; // HID Keyboard (was 0x03C0)
+    // HID appearance (Keyboard or Generic HID both OK)
     adv.appearance_is_present = 1;
-    // Include HID service UUID (0x1812) in the adv (lets iOS classify you as HID)
-    static const ble_uuid16_t hid_uuid16 = BLE_UUID16_INIT(0x1812);
-    adv.uuids16 = (ble_uuid16_t *)&hid_uuid16;
+    adv.appearance = 0x03C0; // HID Keyboard (0x03C0 = Generic)
+
+    // Include BOTH service UUID lists in primary ADV (best for iOS filtering)
+    adv.uuids16 = (ble_uuid16_t *)&s_uuid16_hid;
     adv.num_uuids16 = 1;
     adv.uuids16_is_complete = 1;
 
+    adv.uuids128 = (ble_uuid128_t *)&s_uuid128_img;
+    adv.num_uuids128 = 1;
+    adv.uuids128_is_complete = 1;
+
     rc = ble_gap_adv_set_fields(&adv);
-    if (rc != 0) {
+
+    bool moved_img_uuid_to_rsp = false;
+    if (rc == BLE_HS_EMSGSIZE) {
+        // Too big. Keep 0x1812 in ADV; move 128-bit image UUID to scan response.
+        ESP_LOGW(TAG, "ADV payload full; moving 128-bit Image UUID to scan response");
+        memset(&adv, 0, sizeof(adv));
+        adv.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+        adv.appearance_is_present = 1;
+        adv.appearance = 0x03C1;
+        adv.uuids16 = (ble_uuid16_t *)&s_uuid16_hid;
+        adv.num_uuids16 = 1;
+        adv.uuids16_is_complete = 1;
+
+        rc = ble_gap_adv_set_fields(&adv);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Failed to set ADV fields (fallback): %d", rc);
+            return;
+        }
+        moved_img_uuid_to_rsp = true;
+    } else if (rc != 0) {
         ESP_LOGE(TAG, "Failed to set ADV fields: %d", rc);
         return;
     }
 
-    // --- Scan Response: put the (long) device name here so it won't get truncated ---
+    // --- Scan Response: name (maybe shortened) and 128-bit UUID if moved ---
     memset(&rsp, 0, sizeof(rsp));
-    const char *name = "ESP-Face-Detector";
-    rsp.name = (uint8_t *)name;
-    rsp.name_len = strlen(name);
+
+    // Put device name in scan response (safer vs truncation).
+    const char *full_name = "ESP";
+    rsp.name = (uint8_t *)full_name;
+    rsp.name_len = strlen(full_name);
     rsp.name_is_complete = 1;
 
-    rc = ble_gap_adv_rsp_set_fields(&rsp);
+    if (moved_img_uuid_to_rsp) {
+        rsp.uuids128 = (ble_uuid128_t *)&s_uuid128_img;
+        rsp.num_uuids128 = 1;
+        rsp.uuids128_is_complete = 1;
+
+        rc = ble_gap_adv_rsp_set_fields(&rsp);
+        if (rc == BLE_HS_EMSGSIZE) {
+            // Still too big: shorten the name (incomplete name flag)
+            ESP_LOGW(TAG, "Scan response full; shortening name");
+            static char short_name[12]; // stays in .bss
+            snprintf(short_name, sizeof(short_name), "ESP-Face");
+            rsp.name = (uint8_t *)short_name;
+            rsp.name_len = strlen(short_name);
+            rsp.name_is_complete = 0; // indicate truncated name
+
+            rc = ble_gap_adv_rsp_set_fields(&rsp);
+        }
+    } else {
+        // 128-bit UUID already in primary ADV; scan response only carries name
+        rc = ble_gap_adv_rsp_set_fields(&rsp);
+        if (rc == BLE_HS_EMSGSIZE) {
+            ESP_LOGW(TAG, "Scan response name too long; shortening");
+            static char short_name[12];
+            snprintf(short_name, sizeof(short_name), "ESP-Face");
+            rsp.name = (uint8_t *)short_name;
+            rsp.name_len = strlen(short_name);
+            rsp.name_is_complete = 0;
+            rc = ble_gap_adv_rsp_set_fields(&rsp);
+        }
+    }
+
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to set scan response fields: %d", rc);
         return;
@@ -342,8 +402,8 @@ static void start_advertising(void)
     memset(&adv_params, 0, sizeof(adv_params));
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;   // connectable undirected
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;   // general discoverable
-    adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
-    adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
+    adv_params.itvl_min  = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
+    adv_params.itvl_max  = BLE_GAP_ADV_FAST_INTERVAL1_MAX;
 
     rc = ble_gap_adv_start(g_own_addr_type, NULL, BLE_HS_FOREVER,
                            &adv_params, gap_event_cb, NULL);
@@ -352,7 +412,12 @@ static void start_advertising(void)
         return;
     }
 
-    ESP_LOGI(TAG, "BLE advertising started (HID appearance + 0x1812 in ADV, name in scan response)");
+    ESP_LOGI(TAG, "Advertising started:");
+    ESP_LOGI(TAG, "  ADV: flags+appearance+%s%s",
+             "0x1812", moved_img_uuid_to_rsp ? "" : " + IMG-UUID128");
+    ESP_LOGI(TAG, "  RSP: %s%s",
+             "name",
+             moved_img_uuid_to_rsp ? " + IMG-UUID128" : "");
 }
 
 
@@ -363,39 +428,34 @@ static void on_reset(int reason)
 
 static void on_sync(void)
 {
-    // Start all registered GATT services once, from on_sync
+    // Start services first (as you already do)
     int rc = ble_gatts_start();
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_gatts_start rc=%d", rc);
-        return;
-    }
+    if (rc != 0) { ESP_LOGE(TAG, "ble_gatts_start rc=%d", rc); return; }
     ESP_LOGI(TAG, "All GATT services started");
 
-    // Now that services are started, resolve handles
-    ble_img_xfer_resolve_handles();      // INFO/DATA handles
-    ESP_ERROR_CHECK(ble_hid_get_handles()); // HID value/CCCD handles
+    ble_img_xfer_resolve_handles();
+    ESP_ERROR_CHECK(ble_hid_get_handles());
 
-    // Set preferred MTU (optional, here is fine)
     ble_att_set_preferred_mtu(247);
-   // ble_hid_start_demo_task();
-    
 
-    uint8_t own_addr_type;
-    rc = ble_hs_id_infer_auto(0, &own_addr_type);
-    if (rc != 0) { ESP_LOGE(TAG, "infer addr type rc=%d", rc); return; }
-    g_own_addr_type = own_addr_type;           // keep this global
-    // Optional but nice: log the address we’re using.
-    // Get and log our BLE address
+    // Figure out own address type safely
+    rc = ble_hs_id_infer_auto(0, &g_own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_id_infer_auto rc=%d", rc);
+        g_own_addr_type = BLE_OWN_ADDR_RANDOM; // last-ditch
+    }
+
+    // Log the actual address we’ll use
     uint8_t addr_val[6];
     rc = ble_hs_id_copy_addr(g_own_addr_type, addr_val, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "ble_hs_id_copy_addr rc=%d", rc);
-        return;
+    if (rc == 0) {
+        ESP_LOGI(TAG, "Using own_addr_type=%u (%s) %02X:%02X:%02X:%02X:%02X:%02X",
+                 g_own_addr_type,
+                 (g_own_addr_type == BLE_OWN_ADDR_PUBLIC ? "PUBLIC" : "RANDOM/RPA"),
+                 addr_val[5], addr_val[4], addr_val[3], addr_val[2], addr_val[1], addr_val[0]);
+    } else {
+        ESP_LOGW(TAG, "ble_hs_id_copy_addr rc=%d", rc);
     }
-    ESP_LOGI(TAG, "Using addr type=%u %02X:%02X:%02X:%02X:%02X:%02X",
-            g_own_addr_type,
-            addr_val[5], addr_val[4], addr_val[3],
-            addr_val[2], addr_val[1], addr_val[0]);
 
     start_advertising();
 }
@@ -410,12 +470,22 @@ static void ble_start_all(const char *device_name)
     nimble_port_init();
     ble_store_config_init();
 
+        // Require bonding; Just Works (no IO); enable LE Secure Connections
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm    = 0;   // set 1 if you add passkey/pin UX later
+    ble_hs_cfg.sm_sc      = 1;
+    ble_hs_cfg.sm_io_cap  = BLE_HS_IO_NO_INPUT_OUTPUT;
+
+    // Distribute encryption and identity keys so iOS will remember you
+    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+
     // Configure NimBLE host callbacks BEFORE the host starts
     ble_hs_cfg.store_status_cb = NULL;
     ble_hs_cfg.reset_cb        = on_reset;
     ble_hs_cfg.sync_cb         = on_sync;
 
-    ble_app_set_random_addr();
+    //ble_app_set_random_addr();
     // Core GAP/GATT services
     ble_svc_gap_init();
     ble_svc_gatt_init();

@@ -447,10 +447,10 @@ static void on_paj_gesture(paj7620_gesture_t g)
     else if (g & PAJ7620_GESTURE_RIGHT)   (void)ble_hid_cc_tap_next();
     else if (g & PAJ7620_GESTURE_FORWARD) {
         // TODO: trigger PHOTO (placeholder)
-        (void)ble_hid_cc_tap_play_pause(); // or leave commented for now
+     //   (void)ble_hid_cc_tap_play_pause(); // or leave commented for now
     } else if (g & PAJ7620_GESTURE_BACKWARD) {
         // TODO: trigger VIDEO (placeholder)
-        (void)ble_hid_cc_tap_mute(); // or leave commented
+       // (void)ble_hid_cc_tap_mute(); // or leave commented
     }
 }
 

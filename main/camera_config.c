@@ -33,7 +33,7 @@ esp_err_t init_camera(void)
 
     // Stable RGB565 capture for detection
     config.pixel_format = PIXFORMAT_RGB565;
-    config.frame_size   = FRAMESIZE_QVGA;      // 320x240 → 153600 bytes
+        config.frame_size   = FRAMESIZE_HD;      // 320x240 → 153600 bytes
     config.fb_count     = 2;
     config.jpeg_quality = 12;                  // ignored for RGB565
     config.grab_mode    = CAMERA_GRAB_LATEST;
