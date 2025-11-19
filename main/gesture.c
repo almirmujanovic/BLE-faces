@@ -465,7 +465,7 @@ void paj7620_task(void *pvParameters) {
         gesture = paj7620_get_gesture();
 
         if (gesture != PAJ7620_GESTURE_NONE && gesture != last_gesture) {
-            ESP_LOGI(TAG, "👋 Gesture: %s (0x%04X)", paj7620_gesture_name(gesture), gesture);
+            ESP_LOGI(TAG, "GESTURE: %s (0x%04X)", paj7620_gesture_name(gesture), gesture);
             on_paj_gesture(gesture);
             last_gesture = gesture;
         } else if (gesture == PAJ7620_GESTURE_NONE) {

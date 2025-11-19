@@ -30,6 +30,7 @@ typedef struct {
     uint32_t total_len;
     uint32_t sent;
     bool active;
+    TickType_t start_ticks;
 } transfer_state_t;
 
 static transfer_state_t g_transfer = {0};
@@ -244,6 +245,7 @@ static void pump_task(void *pvParameters)
                     g_transfer.total_len = msg.len;
                     g_transfer.sent = 0;
                     g_transfer.active = true;
+                    g_transfer.start_ticks = xTaskGetTickCount();
                     // Fall through to start pumping
                     
                 case PUMP_CONTINUE:
@@ -257,7 +259,9 @@ static void pump_task(void *pvParameters)
                     
                     uint32_t remaining = g_transfer.total_len - g_transfer.sent;
                     if (remaining == 0) {
-                        ESP_LOGI(TAG, "Transfer complete: %lu bytes", g_transfer.sent);
+                        TickType_t end_ticks = xTaskGetTickCount();
+                        float elapsed_sec = (end_ticks - g_transfer.start_ticks) / (float)configTICK_RATE_HZ;
+                        ESP_LOGI(TAG, "Transfer complete: %lu bytes in %.2f seconds", g_transfer.sent, elapsed_sec);    
                         cleanup_transfer();
                         break;
                     }

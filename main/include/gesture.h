@@ -115,4 +115,6 @@ void paj7620_task(void *pvParameters);
 
 esp_err_t ble_hid_tap_key(uint8_t keycode, uint8_t modifier);
 
+// Gestures detection edge impulse:
+void gesture_ei_task(void *pvParameter);
 #endif // PAJ7620_H

@@ -1,5 +1,7 @@
 /build
+/main/build
 /managed_components
+/components
 sdkconfig.old
 /.vscode
 dependencies.lock
