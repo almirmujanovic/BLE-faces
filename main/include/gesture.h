@@ -1,12 +1,12 @@
-#ifndef PAJ7620_H
-#define PAJ7620_H
+#ifndef GESTURE_H
+#define GESTURE_H
 
-#include "driver/i2c_master.h"
+#include "power.h"
 #include "esp_err.h"
 #include <stdint.h>
 #include <stdbool.h>
 
-// I2C Configuration
+// I2C Configuration (pins/port now configured in power.c; kept here for reference)
 #define PAJ7620_I2C_NUM         I2C_NUM_0
 #define PAJ7620_I2C_SDA_PIN     21
 #define PAJ7620_I2C_SCL_PIN     20
@@ -82,7 +82,7 @@ typedef enum {
 } paj7620_bank_t;
 
 /**
- * @brief Initialize I2C bus for PAJ7620
+ * @brief Initialize I2C device for PAJ7620 (uses shared I2C bus from power.c)
  */
 esp_err_t paj7620_i2c_init(void);
 

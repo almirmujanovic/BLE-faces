@@ -1,70 +1,152 @@
-#include "include/camera_config.h"
+#include "camera_config.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-static const char *TAG = "CAMERA";
+static const char *TAG = "CAMERA_OV5640";
 
 esp_err_t init_camera(void)
 {
-    camera_config_t config = {0};
-    config.ledc_channel   = LEDC_CHANNEL_0;
-    config.ledc_timer     = LEDC_TIMER_0;
+    ESP_LOGI(TAG, "esp_camera_init() for OV5640 YUV422...");
 
-    // Data pins
-    config.pin_d0 = Y2_GPIO_NUM;
-    config.pin_d1 = Y3_GPIO_NUM;
-    config.pin_d2 = Y4_GPIO_NUM;
-    config.pin_d3 = Y5_GPIO_NUM;
-    config.pin_d4 = Y6_GPIO_NUM;
-    config.pin_d5 = Y7_GPIO_NUM;
-    config.pin_d6 = Y8_GPIO_NUM;
-    config.pin_d7 = Y9_GPIO_NUM;
+    // --- Power-down pin  ---
+    if (CAM_PWDN_GPIO >= 0) {
+        gpio_config_t io_conf = {
+            .pin_bit_mask = 1ULL << CAM_PWDN_GPIO,
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(CAM_PWDN_GPIO, 0);  // power ON
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 
-    // Sync/clock pins
-    config.pin_xclk      = XCLK_GPIO_NUM;
-    config.pin_pclk      = PCLK_GPIO_NUM;
-    config.pin_vsync     = VSYNC_GPIO_NUM;
-    config.pin_href      = HREF_GPIO_NUM;
-    config.pin_sccb_sda  = SIOD_GPIO_NUM;
-    config.pin_sccb_scl  = SIOC_GPIO_NUM;
+    // --- Reset pin ---
+    if (CAM_RESET_GPIO >= 0) {
+        gpio_config_t io_conf = {
+            .pin_bit_mask = 1ULL << CAM_RESET_GPIO,
+            .mode         = GPIO_MODE_OUTPUT,
+            .pull_up_en   = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type    = GPIO_INTR_DISABLE,
+        };
+        gpio_config(&io_conf);
+        gpio_set_level(CAM_RESET_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        gpio_set_level(CAM_RESET_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 
-    // Power/reset
-    config.pin_pwdn  = PWDN_GPIO_NUM;
-    config.pin_reset = RESET_GPIO_NUM;
 
-    // Stable RGB565 capture for detection
-    config.pixel_format = PIXFORMAT_RGB565;
-        config.frame_size   = FRAMESIZE_HD;      // 320x240 → 153600 bytes
-    config.fb_count     = 2;
-    config.jpeg_quality = 12;                  // ignored for RGB565
-    config.grab_mode    = CAMERA_GRAB_LATEST;
-    config.fb_location  = CAMERA_FB_IN_PSRAM;
-    config.xclk_freq_hz = 10000000;            // 10 MHz is OK for RGB565/QVGA
+    // --------------------------------------------------------------------
+    camera_config_t config = {
+        .pin_pwdn      = CAM_PWDN_GPIO,
+        .pin_reset     = CAM_RESET_GPIO,
+        .pin_xclk      = CAM_XCLK_GPIO,
+        .pin_sscb_sda  = CAM_SIOD_GPIO,
+        .pin_sscb_scl  = CAM_SIOC_GPIO,
+
+        .pin_d7        = CAM_D7_GPIO,
+        .pin_d6        = CAM_D6_GPIO,
+        .pin_d5        = CAM_D5_GPIO,
+        .pin_d4        = CAM_D4_GPIO,
+        .pin_d3        = CAM_D3_GPIO,
+        .pin_d2        = CAM_D2_GPIO,
+        .pin_d1        = CAM_D1_GPIO,
+        .pin_d0        = CAM_D0_GPIO,
+
+        .pin_vsync     = CAM_VSYNC_GPIO,
+        .pin_href      = CAM_HREF_GPIO,
+        .pin_pclk      = CAM_PCLK_GPIO,
+
+        .xclk_freq_hz  = 20000000,
+        .ledc_timer    = LEDC_TIMER_0,
+        .ledc_channel  = LEDC_CHANNEL_0,
+
+        .pixel_format  = PIXFORMAT_RGB565,
+        .frame_size    = FRAMESIZE_QVGA,
+        .jpeg_quality  = 12,
+        .fb_count      = 2,
+        .fb_location   = CAMERA_FB_IN_PSRAM,
+        .grab_mode     = CAMERA_GRAB_LATEST,
+    };
+    // --------------------------------------------------------------------
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
+        ESP_LOGE(TAG, "esp_camera_init FAILED: 0x%x", err);
         return err;
     }
 
     sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-        s->set_hmirror(s, 0);
-        s->set_vflip(s, 0);
-        s->set_brightness(s, 0);
-        s->set_contrast(s, 0);
-        s->set_saturation(s, 0);
+    if (!s) {
+        ESP_LOGE(TAG, "Failed to get sensor");
+        return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Camera initialized successfully");
+    ESP_LOGI(TAG, "Detected sensor PID: 0x%02X", s->id.PID);
+
+    if (s->id.PID == OV5640_PID) {
+        ESP_LOGI(TAG, "Configuring OV5640...");
+
+        /* ---- BASIC, NEUTRAL SETTINGS ---- */
+
+  // Make sure we are really RGB565 + VGA
+    s->set_pixformat(s, PIXFORMAT_RGB565);
+    s->set_framesize(s, FRAMESIZE_QVGA);
+
+    // ---------- PROFILE A: “balanced defaults” (good starting point) ----------
+    // Make sure auto-exposure and auto-gain are ON
+    s->set_exposure_ctrl(s, 1);   // enable AEC (auto exposure)
+    s->set_ae_level(s, 0);        // tweak -2..2, try 0 or +1 if still dark
+    s->set_aec2(s, 1);            // improved AEC if supported
+
+    s->set_gain_ctrl(s, 1);       // enable AGC (auto gain)
+    s->set_agc_gain(s, 0);        // let it pick gain
+
+    // Auto white balance
+    s->set_whitebal(s, 1);        // enable AWB
+    s->set_awb_gain(s, 1);        // enable AWB gain
+    s->set_wb_mode(s, 0);         // 0 = auto (others: 1=sunny, 2=cloudy, etc.)
+
+    // General look
+    s->set_brightness(s, 1);      // -2..2   (1 brightens a bit)
+    s->set_contrast(s, 1);        // -2..2
+    s->set_saturation(s, 1);      // -2..2
+    s->set_special_effect(s, 0);  // 0 = none (make sure no sepia/negative/etc.)
+
+    // Lens / correction
+    s->set_lenc(s, 1);            // lens correction
+    s->set_bpc(s, 1);             // black pixel correction
+    s->set_wpc(s, 1);             // white pixel correction
+    s->set_raw_gma(s, 1);         // gamma curve on
+
+
+        ESP_LOGI(TAG, "OV5640 is running ");
+    }
+
+    ESP_LOGI(TAG, "Camera init COMPLETE.");
     return ESP_OK;
 }
 
-camera_fb_t* capture_frame(void)
+camera_fb_t *capture_frame(void)
 {
     return esp_camera_fb_get();
 }
 
-void release_frame(camera_fb_t* fb)
+void release_frame(camera_fb_t *fb)
 {
     if (fb) esp_camera_fb_return(fb);
+}
+
+void camera_discard_initial_frames(int count)
+{
+    for (int i = 0; i < count; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
 }

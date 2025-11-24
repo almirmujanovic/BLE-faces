@@ -8,6 +8,12 @@ idf_component_register(
         "gesture.c"
         "ble_hid.c"
         "ble_gatts_utils.c"
+        "media.c"
+        "http_server.c"
+        "leds.c"
+        "power.c"
+        "button.c"
+        "wifi_control.c"
     INCLUDE_DIRS
         "." "include"
     REQUIRES
@@ -17,5 +23,8 @@ idf_component_register(
         esp32-camera
         human_face_detect
         esp-dl
+        spiffs
+        esp_http_server
+        espressif__esp_jpeg
 )
 target_compile_features(${COMPONENT_LIB} PRIVATE cxx_std_17)

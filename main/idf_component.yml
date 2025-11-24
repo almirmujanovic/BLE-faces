@@ -2,4 +2,5 @@ dependencies:
   idf: ">=5.4.0"
   espressif/esp32-camera: "^2.1.0"
   espressif/esp-dl: "^3.1.5"
-  espressif/human_face_detect: "^0.2.3"   # optional (model component)
+  espressif/human_face_detect: "^0.3.0"   
+  #espressif/esp-nn: "^1.1.0"

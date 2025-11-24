@@ -1,3 +1,5 @@
+#include "gesture.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "gesture.h"
@@ -5,11 +7,11 @@
 #include "driver/i2c_master.h"
 #include <string.h>
 #include "ble_hid.h"
+#include "media.h"
 
 static const char *TAG = "PAJ7620";
 
-// I2C master bus and device handles
-static i2c_master_bus_handle_t i2c_bus_handle = NULL;
+// Only a device handle now; bus comes from power.c
 static i2c_master_dev_handle_t paj7620_dev_handle = NULL;
 
 // Global state
@@ -241,12 +243,14 @@ static const uint8_t init_register_array[][2] = {
 
 // Write a single byte to PAJ7620 register
 static esp_err_t paj7620_write_reg(uint8_t reg, uint8_t data) {
+    if (!paj7620_dev_handle) return ESP_ERR_INVALID_STATE;
     uint8_t write_buf[2] = {reg, data};
     return i2c_master_transmit(paj7620_dev_handle, write_buf, 2, -1);
 }
 
 // Read bytes from PAJ7620 register
 static esp_err_t paj7620_read_reg(uint8_t reg, uint8_t *data, size_t len) {
+    if (!paj7620_dev_handle) return ESP_ERR_INVALID_STATE;
     return i2c_master_transmit_receive(paj7620_dev_handle, &reg, 1, data, len, -1);
 }
 
@@ -255,91 +259,98 @@ static esp_err_t paj7620_select_bank(paj7620_bank_t bank) {
     return paj7620_write_reg(PAJ7620_REGITER_BANK_SEL, (uint8_t)bank);
 }
 
+// ------------------------------------------------------
+// I2C init – attach to shared bus from power.c
+// ------------------------------------------------------
 esp_err_t paj7620_i2c_init(void) {
     esp_err_t ret;
-    
-    // Configure I2C master bus
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port = PAJ7620_I2C_NUM,
-        .sda_io_num = PAJ7620_I2C_SDA_PIN,
-        .scl_io_num = PAJ7620_I2C_SCL_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    
-    ret = i2c_new_master_bus(&bus_config, &i2c_bus_handle);
+
+    if (paj7620_dev_handle) {
+        // Already initialized
+        return ESP_OK;
+    }
+
+    // Ensure the shared bus is initialized
+    ret = power_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2C master bus init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "power_init() failed: %s", esp_err_to_name(ret));
         return ret;
     }
-    
-    // Configure PAJ7620 device
+
+    i2c_master_bus_handle_t bus = power_get_i2c_bus();
+    if (!bus) {
+        ESP_LOGE(TAG, "No I2C bus handle from power module");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Configure PAJ7620 device on the existing bus
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = PAJ7620_I2C_ADDR,
-        .scl_speed_hz = PAJ7620_I2C_FREQ_HZ,
+        .device_address  = PAJ7620_I2C_ADDR,
+        .scl_speed_hz    = PAJ7620_I2C_FREQ_HZ,
     };
-    
-    ret = i2c_master_bus_add_device(i2c_bus_handle, &dev_config, &paj7620_dev_handle);
+
+    ret = i2c_master_bus_add_device(bus, &dev_config, &paj7620_dev_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to add PAJ7620 device: %s", esp_err_to_name(ret));
-        i2c_del_master_bus(i2c_bus_handle);
+        paj7620_dev_handle = NULL;
         return ret;
     }
-    
-    ESP_LOGI(TAG, "I2C initialized on SDA=%d, SCL=%d", PAJ7620_I2C_SDA_PIN, PAJ7620_I2C_SCL_PIN);
+
+    ESP_LOGI(TAG, "PAJ7620 I2C attached on shared bus, addr=0x%02X", PAJ7620_I2C_ADDR);
     return ESP_OK;
 }
 
 esp_err_t paj7620_init(void) {
     esp_err_t ret;
     uint8_t part_id[2];
-    
+
     // Wait for sensor to wake up
     vTaskDelay(pdMS_TO_TICKS(800));
-    
+
     // Select Bank 0
     ret = paj7620_select_bank(PAJ7620_BANK0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to select bank 0");
         return ret;
     }
-    
+
     // Read Part ID (2 bytes)
     ret = paj7620_read_reg(PAJ7620_ADDR_PART_ID_LOW, part_id, 2);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to read Part ID");
         return ret;
     }
-    
+
     uint16_t pid = part_id[0] | (part_id[1] << 8);
     ESP_LOGI(TAG, "Part ID: 0x%04X", pid);
-    
+
     if (pid != PAJ7620_PARTID) {
-        ESP_LOGE(TAG, "Invalid Part ID! Expected 0x%04X, got 0x%04X", PAJ7620_PARTID, pid);
+        ESP_LOGE(TAG, "Invalid Part ID! Expected 0x%04X, got 0x%04X",
+                 PAJ7620_PARTID, pid);
         return ESP_ERR_NOT_FOUND;
     }
-    
+
     // Write initialization array
     size_t init_array_size = sizeof(init_register_array) / sizeof(init_register_array[0]);
-    ESP_LOGI(TAG, "Writing %d initialization registers...", init_array_size);
-    
+    ESP_LOGI(TAG, "Writing %d initialization registers...", (int)init_array_size);
+
     for (size_t i = 0; i < init_array_size; i++) {
         ret = paj7620_write_reg(init_register_array[i][0], init_register_array[i][1]);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to write init register %d", i);
+            ESP_LOGE(TAG, "Failed to write init register %d (reg=0x%02X)", (int)i,
+                     init_register_array[i][0]);
             return ret;
         }
     }
-    
+
     // Select Bank 0 for gesture reading
     ret = paj7620_select_bank(PAJ7620_BANK0);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to select bank 0");
         return ret;
     }
-    
+
     ESP_LOGI(TAG, "PAJ7620 initialized successfully");
     return ESP_OK;
 }
@@ -351,11 +362,11 @@ void paj7620_set_high_rate(bool high_rate) {
 paj7620_gesture_t paj7620_get_gesture(void) {
     uint8_t data_flag1 = 0;
     uint8_t data_flag0 = 0;
-    
+
     // Read FLAG_1 first (for wave detection)
     paj7620_read_reg(PAJ7620_ADDR_GES_PS_DET_FLAG_1, &data_flag1, 1);
     _current_gesture = (paj7620_gesture_t)(((uint16_t)data_flag1) << 8);
-    
+
     if (_current_gesture == PAJ7620_GESTURE_WAVE) {
         ESP_LOGD(TAG, "Wave detected (FLAG_1)");
         vTaskDelay(pdMS_TO_TICKS(GES_QUIT_TIME));
@@ -364,7 +375,7 @@ paj7620_gesture_t paj7620_get_gesture(void) {
         // Read FLAG_0 for other gestures
         paj7620_read_reg(PAJ7620_ADDR_GES_PS_DET_FLAG_0, &data_flag0, 1);
         _current_gesture = (paj7620_gesture_t)(((uint16_t)data_flag0) & 0x00FF);
-        
+
         if (!_gesture_high_rate && _current_gesture != PAJ7620_GESTURE_NONE) {
             // Slow mode: wait and read again to detect combined gestures
             uint8_t tmp = 0;
@@ -372,10 +383,10 @@ paj7620_gesture_t paj7620_get_gesture(void) {
             paj7620_read_reg(PAJ7620_ADDR_GES_PS_DET_FLAG_0, &tmp, 1);
             _current_gesture = (paj7620_gesture_t)(((uint16_t)_current_gesture) | tmp);
         }
-        
+
         if (_current_gesture != PAJ7620_GESTURE_NONE) {
             // Add delays for forward/backward gestures
-            if (_current_gesture == PAJ7620_GESTURE_FORWARD || 
+            if (_current_gesture == PAJ7620_GESTURE_FORWARD ||
                 _current_gesture == PAJ7620_GESTURE_BACKWARD) {
                 if (!_gesture_high_rate) {
                     vTaskDelay(pdMS_TO_TICKS(GES_QUIT_TIME));
@@ -383,7 +394,7 @@ paj7620_gesture_t paj7620_get_gesture(void) {
                     vTaskDelay(pdMS_TO_TICKS(GES_QUIT_TIME / 5));
                 }
             }
-            
+
             // Check for combined wave gestures
             if (_current_gesture != PAJ7620_GESTURE_RIGHT &&
                 _current_gesture != PAJ7620_GESTURE_LEFT &&
@@ -393,7 +404,7 @@ paj7620_gesture_t paj7620_get_gesture(void) {
                 _current_gesture != PAJ7620_GESTURE_BACKWARD &&
                 _current_gesture != PAJ7620_GESTURE_CLOCKWISE &&
                 _current_gesture != PAJ7620_GESTURE_ANTICLOCKWISE) {
-                
+
                 // Check FLAG_1 again for wave
                 paj7620_read_reg(PAJ7620_ADDR_GES_PS_DET_FLAG_1, &data_flag1, 1);
                 if (data_flag1) {
@@ -409,7 +420,7 @@ paj7620_gesture_t paj7620_get_gesture(void) {
             }
         }
     }
-    
+
     return _current_gesture;
 }
 
@@ -429,31 +440,46 @@ const char* paj7620_gesture_name(paj7620_gesture_t gesture) {
         case PAJ7620_GESTURE_WAVE_SLOWLY_LEFT_RIGHT: return "WaveSlowlyLeftRight";
         case PAJ7620_GESTURE_WAVE_SLOWLY_UP_DOWN: return "WaveSlowlyUpDown";
         case PAJ7620_GESTURE_WAVE_SLOWLY_FORWARD_BACKWARD: return "WaveSlowlyForwardBackward";
-        
+
         default: return "Unknown";
     }
 }
 
 static void on_paj_gesture(paj7620_gesture_t g)
 {
-    if (!ble_hid_is_ready()) {
-        // Not connected or CCCD not enabled yet; ignore gestures quietly
+    if (g & PAJ7620_GESTURE_CLOCKWISE) {
+        // PHOTO (VGA)
+        ESP_LOGI(TAG, "📸 Taking photo (VGA)...");
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            esp_err_t ret = media_save_photo(fb); // media_save_photo should handle VGA now
+            esp_camera_fb_return(fb);
+            (void)ret;
+        } else {
+            ESP_LOGE(TAG, "❌ Camera capture failed");
+        }
         return;
     }
 
+    if (g & PAJ7620_GESTURE_ANTICLOCKWISE) {
+        // VIDEO (disabled for now, but kept for future)
+        // esp_err_t res = media_capture_jpeg_burst(10000, 20, 200);
+        // (void)res;
+    }
+
+    // BLE HID CONTROLS (only when connected)
+    if (!ble_hid_is_ready()) {
+        // Not connected - ignore other gestures
+        return;
+    }
+
+    // BLE is connected - use other gestures for HID
     if (g & PAJ7620_GESTURE_UP)           (void)ble_hid_cc_tap_vol_up();
     else if (g & PAJ7620_GESTURE_DOWN)    (void)ble_hid_cc_tap_vol_down();
+    else if (g & PAJ7620_GESTURE_WAVE)    (void)ble_hid_cc_tap_vol_down();
     else if (g & PAJ7620_GESTURE_LEFT)    (void)ble_hid_cc_tap_prev();
     else if (g & PAJ7620_GESTURE_RIGHT)   (void)ble_hid_cc_tap_next();
-    else if (g & PAJ7620_GESTURE_FORWARD) {
-        // TODO: trigger PHOTO (placeholder)
-     //   (void)ble_hid_cc_tap_play_pause(); // or leave commented for now
-    } else if (g & PAJ7620_GESTURE_BACKWARD) {
-        // TODO: trigger VIDEO (placeholder)
-       // (void)ble_hid_cc_tap_mute(); // or leave commented
-    }
 }
-
 
 void paj7620_task(void *pvParameters) {
     paj7620_gesture_t gesture;
@@ -475,4 +501,3 @@ void paj7620_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(_gesture_high_rate ? 50 : 100));
     }
 }
-// ...existing code...

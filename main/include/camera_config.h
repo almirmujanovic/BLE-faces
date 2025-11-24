@@ -3,36 +3,38 @@
 
 #include "esp_camera.h"
 
-// Freenove ESP32-S3 Eye pin mapping
-#define PWDN_GPIO_NUM     -1
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM     15
-#define SIOD_GPIO_NUM     4
-#define SIOC_GPIO_NUM     5
+// SAME PINOUT AS YOUR WORKING EXAMPLE
+#define CAM_PWDN_GPIO  9
+#define CAM_RESET_GPIO 20
+#define CAM_XCLK_GPIO  4
 
-#define Y2_GPIO_NUM       11
-#define Y3_GPIO_NUM       9
-#define Y4_GPIO_NUM       8
-#define Y5_GPIO_NUM       10
-#define Y6_GPIO_NUM       12
-#define Y7_GPIO_NUM       18
-#define Y8_GPIO_NUM       17
-#define Y9_GPIO_NUM       16
+#define CAM_SIOD_GPIO  2
+#define CAM_SIOC_GPIO  3
 
-#define VSYNC_GPIO_NUM    6
-#define HREF_GPIO_NUM     7
-#define PCLK_GPIO_NUM     13
+#define CAM_VSYNC_GPIO 7
+#define CAM_HREF_GPIO  8
+#define CAM_PCLK_GPIO  21
+
+#define CAM_D0_GPIO    19
+#define CAM_D1_GPIO    10
+#define CAM_D2_GPIO    18
+#define CAM_D3_GPIO    17
+#define CAM_D4_GPIO    14
+#define CAM_D5_GPIO    13
+#define CAM_D6_GPIO    12
+#define CAM_D7_GPIO    11
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Camera configuration
 esp_err_t init_camera(void);
-camera_fb_t* capture_frame(void);
-void release_frame(camera_fb_t* fb);
+
+camera_fb_t *capture_frame(void);
+void release_frame(camera_fb_t *fb);
+void camera_discard_initial_frames(int count);
 
 #ifdef __cplusplus
 }
 #endif
-#endif // CAMERA_CONFIG_H
+#endif

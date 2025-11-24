@@ -12,9 +12,96 @@
 #include "include/ble_server.h"
 #include "include/ble_image_transfer.h"
 #include "include/gesture.h"
-
+#include "include/media.h"
+#include "include/leds.h"
+#include "include/power.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_http_server.h"
+#include <lwip/inet.h>
+#include "leds.h"
+#include "button.h"
+#include "wifi_control.h"
 static const char *TAG = "BLE_FACES";
 
+static bool g_system_idle = false;
+static TaskHandle_t g_face_task_handle = NULL;
+static TaskHandle_t g_img_task_handle  = NULL;
+static TaskHandle_t g_paj_task_handle  = NULL;
+// toggles idle: fully power down camera and suspend tasks; on resume reinit & resume
+static void system_toggle_idle(void)
+{
+    if (!g_system_idle) {
+        // suspend camera-related tasks (keep button task running)
+        if (g_face_task_handle) vTaskSuspend(g_face_task_handle);
+        if (g_img_task_handle)  vTaskSuspend(g_img_task_handle);
+        if (g_paj_task_handle)  vTaskSuspend(g_paj_task_handle);
+
+        ESP_LOGI(TAG, "Entering IDLE: shutting down camera (driver only)...");
+
+        // Deinit camera driver only — do NOT toggle CAM_PWDN_GPIO to avoid disabling shared I2C devices
+        esp_err_t err = esp_camera_deinit();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_camera_deinit failed: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Camera driver deinitialized");
+        }
+
+        // Blink idle LED 3 times as confirmation
+        leds_blink_idle(3, 150);
+
+        // Stop WiFi/server if running
+        if (wifi_control_is_running()) {
+            wifi_control_stop();
+            ESP_LOGI(TAG, "WiFi/server stopped as part of IDLE");
+        }
+
+        ESP_LOGI(TAG, "System entered IDLE (camera driver deinit, tasks suspended)");
+        g_system_idle = true;
+    } else {
+        ESP_LOGI(TAG, "Exiting IDLE: reinitializing camera driver...");
+
+        // Reinitialize camera driver (do not touch global power rails)
+        esp_err_t err = init_camera();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Camera re-init failed: %s. Remaining in IDLE.", esp_err_to_name(err));
+            return;
+        }
+
+        // Reconfigure PCA9536 button input (in case it was affected)
+        leds_configure_button_input();
+
+        // Allow AWB/AEC to settle
+        camera_discard_initial_frames(5);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // resume tasks
+        if (g_face_task_handle) vTaskResume(g_face_task_handle);
+        if (g_img_task_handle)  vTaskResume(g_img_task_handle);
+        if (g_paj_task_handle)  vTaskResume(g_paj_task_handle);
+
+        ESP_LOGI(TAG, "System resumed from IDLE (camera driver reinitialized)");
+        g_system_idle = false;
+    }
+}
+
+// toggles wifi/server on button hold
+static void system_toggle_wifi(void)
+{
+    if (wifi_control_is_running()) {
+        wifi_control_stop();
+        ESP_LOGI(TAG, "WiFi + HTTP server stopped by button hold");
+    } else {
+        esp_err_t r = wifi_control_start();
+        if (r == ESP_OK) {
+            ESP_LOGI(TAG, "WiFi + HTTP server started by button hold");
+        } else {
+            ESP_LOGW(TAG, "Failed to start WiFi via button hold: %s", esp_err_to_name(r));
+        }
+    }
+}
+
+extern httpd_handle_t start_http_server(void);
 // Image processing request structure
 typedef struct {
     uint32_t frame_id;
@@ -225,13 +312,63 @@ void image_processing_task(void *pvParameters)
 }
 
 
-// Application main function
+
+static void wifi_init(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    // Create AP interface with custom IP
+    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    
+    // Stop DHCP server temporarily to set static IP
+    esp_netif_dhcps_stop(ap_netif);
+    
+    // Set custom IP: 192.168.1.100 (gateway/router IP)
+    esp_netif_ip_info_t ip_info;
+    IP4_ADDR(&ip_info.ip, 192, 168, 1, 100);       // AP IP
+    IP4_ADDR(&ip_info.gw, 192, 168, 1, 100);       // Gateway (same)
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);  // Subnet mask
+    
+    esp_netif_set_ip_info(ap_netif, &ip_info);
+    
+    // Restart DHCP server (will assign 192.168.1.101, 192.168.1.102, etc. to clients)
+    esp_netif_dhcps_start(ap_netif);
+    
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = "ESP32-Media",
+            .ssid_len = strlen("ESP32-Media"),
+            .password = "12345678",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .channel = 1
+        },
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    ESP_LOGI("WIFI", "✅ WiFi AP started");
+    ESP_LOGI("WIFI", "   SSID: ESP32-Media");
+    ESP_LOGI("WIFI", "   Password: 12345678");
+    ESP_LOGI("WIFI", "   IP Address: http://192.168.1.100");
+    ESP_LOGI("WIFI", "   Browse media at:");
+    ESP_LOGI("WIFI", "     • http://192.168.1.100/images");
+    ESP_LOGI("WIFI", "     • http://192.168.1.100/videos");
+}
+
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== Starting BLE Face Detection Application ===");
     log_memory_usage("APP_START");
 
-    // Initialize NVS for BLE
+    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -239,31 +376,82 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize camera
+
+    // Initialize media storage (BEFORE gesture sensor)
+    ESP_LOGI(TAG, "Initializing media storage...");
+    ret = media_storage_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Media storage init failed: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "Photo/video capture will not work");
+    } else {
+        ESP_LOGI(TAG, "✅ Media storage ready");
+        
+        // List existing files
+        media_list_files();
+        
+        // Get storage info
+        size_t total, used, free;
+        if (media_get_storage_info(&total, &used, &free) == ESP_OK) {
+            ESP_LOGI(TAG, "Storage: %zu KB total, %zu KB used, %zu KB free", 
+                     total/1024, used/1024, free/1024);
+        }
+    }
+    
+    log_memory_usage("AFTER_MEDIA_STORAGE");
+
+
     ESP_LOGI(TAG, "Initializing camera...");
     ret = init_camera();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Camera initialization failed: 0x%x", ret);
         return;
     }
-    log_memory_usage("AFTER_CAMERA");
 
-    // Test camera capture before proceeding
-    ESP_LOGI(TAG, "Testing camera capture...");
-    camera_fb_t* test_fb = esp_camera_fb_get();
-    if (test_fb) {
-        ESP_LOGI(TAG, "Camera test OK: %dx%d, format=%d, len=%zu", 
-                 test_fb->width, test_fb->height, test_fb->format, test_fb->len);
-        esp_camera_fb_return(test_fb);
+
+   // Take one picture and save it via media.c
+    ESP_LOGI(TAG, "Capturing test image...");
+    camera_fb_t *test_fb = esp_camera_fb_get();
+    if (!test_fb) {
+        ESP_LOGE(TAG, "Test capture failed: no frame buffer");
     } else {
-        ESP_LOGE(TAG, "Camera test failed - cannot capture frames");
-        return;
+        ret = media_save_photo(test_fb);
+        esp_camera_fb_return(test_fb);
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Test capture failed: 0x%x", ret);
+        } else {
+            ESP_LOGI(TAG, "Test capture OK. Check latest photo_* file on SPIFFS.");
+        }
     }
 
+
+    // Initialize WiFi AP
+   // ESP_LOGI(TAG, "Starting WiFi Access Point...");
+  //  wifi_init();
+    
+    // Start HTTP server for media access
+   // ESP_LOGI(TAG, "Starting HTTP file server...");
+    //httpd_handle_t server = start_http_server();
+    //if (server) {
+     //   ESP_LOGI(TAG, "✅ HTTP server running at http://192.168.1.100/");
+       // ESP_LOGI(TAG, "   Connect to WiFi: SSID='ESP32-Media', Password='12345678'");
+   // } else {
+     //   ESP_LOGW(TAG, "Failed to start HTTP server");
+    //}
+
+    /*
+    esp_err_t res = media_capture_jpeg_burst(10000, 20, 200);
+        if (res == ESP_OK) {
+            ESP_LOGI(TAG, "🎥 Captured burst video (VGA) for %d ms at %d FPS", 10000, 20);
+        } else {
+            ESP_LOGE(TAG, "❌ Burst video capture failed: %s", esp_err_to_name(res));
+        }
+        return;
+*/
+
+    // Initialize BLE
     ESP_LOGI(TAG, "Starting BLE server...");
     ble_server_start("ESP-Face-Detector");
-    
-    // Wait for BLE server to initialize
     vTaskDelay(pdMS_TO_TICKS(1000));
     
     // Initialize face detection
@@ -283,47 +471,62 @@ void app_main(void)
         return;
     }
 
-    // Create face detection task (KEEP original small stack)
+    // Create face detection task
     ESP_LOGI(TAG, "Creating face detection task...");
     BaseType_t ok = xTaskCreate(face_detection_task, "face_detection_task", 
-                               8192, NULL, 6, NULL); // 8KB - same as before
+                               8192, NULL, 6, &g_face_task_handle);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create face_detection_task");
         return;
     }
-    
     log_memory_usage("AFTER_FACE_TASK");
 
-    // Create separate image processing task with large stack for PSRAM operations
+    // Create image processing task
     ESP_LOGI(TAG, "Creating image processing task...");
     ok = xTaskCreate(image_processing_task, "image_processing_task", 
-                    65536, NULL, 4, NULL); // 64KB for heavy processing
+                    16384, NULL, 4, &g_img_task_handle);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create image_processing_task");
         return;
     }
-    
     log_memory_usage("AFTER_IMG_TASK");
+    // Init I2C bus for power/LEDs
+    // Initialize power / I2C bus (new driver)
+    if (power_init() == ESP_OK) {
+        uint8_t id;
+        power_bq25155_read_id(&id);  // will just warn if not present
+    }
 
-    // Start BLE server
-    // Initialize gesture sensor AFTER BLE is ready
+    // Initialize LEDs on PCA9536
+    if (leds_init() == ESP_OK) {
+        leds_blink_both(2, 100);  // quick sanity blink
+    }
+        button_start(system_toggle_idle, system_toggle_wifi, 50, 500, 2000);
+
+    // Initialize gesture sensor LAST
+   
     ESP_LOGI(TAG, "Initializing gesture sensor...");
     ret = paj7620_i2c_init();
     if (ret == ESP_OK) {
         ret = paj7620_init();
         if (ret == ESP_OK) {
-            paj7620_set_high_rate(true); // Fast detection mode
-            xTaskCreatePinnedToCore(paj7620_task, "paj", 4096, NULL, 2 /*low*/, NULL, 1 /*APP core*/);            ESP_LOGI(TAG, "Gesture sensor initialized successfully");
+            paj7620_set_high_rate(true);
+            xTaskCreatePinnedToCore(paj7620_task, "paj7620_task", 
+                                   4096, NULL, 2, &g_paj_task_handle, 1);
+            ESP_LOGI(TAG, "✅ Gesture sensor initialized");
+            ESP_LOGI(TAG, "   FORWARD gesture  = Take photo");
+            ESP_LOGI(TAG, "   BACKWARD gesture = Start/Stop video");
+            ESP_LOGI(TAG, "   UP/DOWN/LEFT/RIGHT = BLE HID (when connected)");
         } else {
-            ESP_LOGW(TAG, "Gesture sensor init failed, continuing without gestures");
+            ESP_LOGW(TAG, "Gesture sensor init failed");
         }
     } else {
-        ESP_LOGW(TAG, "Gesture I2C init failed, continuing without gestures");
+        ESP_LOGW(TAG, "Gesture I2C init failed");
     }
     
     log_memory_usage("APP_COMPLETE");
     ESP_LOGI(TAG, "=== Application started successfully ===");
-    ESP_LOGI(TAG, "Face detection: 8KB stack task");
-    ESP_LOGI(TAG, "Image processing: 64KB stack task with PSRAM buffers");
-    ESP_LOGI(TAG, "Ready to detect faces and stream crops via BLE!");
+    ESP_LOGI(TAG, "📸 Photo: FORWARD gesture");
+    ESP_LOGI(TAG, "🎥 Video: BACKWARD gesture (toggle)");
+    ESP_LOGI(TAG, "Ready!");
 }
