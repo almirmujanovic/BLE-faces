@@ -12,6 +12,7 @@
 #include "include/ble_server.h"
 #include "include/ble_image_transfer.h"
 #include "include/gesture.h"
+#include "include/hand_gesture_ml.h"
 #include "include/media.h"
 #include "include/leds.h"
 #include "include/power.h"
@@ -204,7 +205,9 @@ void process_face_crop_and_send(uint32_t frame_id, uint16_t x, uint16_t y,
              w, h, x, y, img_width, img_height);
     
     // Send the notification (lightweight)
+#if 0
     ble_send_face_notification(frame_id, 1, x, y, w, h, confidence);
+#endif
     
     // Do heavy image processing here (safe with large stack)
     int use_x, use_y, use_w, use_h;
@@ -220,9 +223,12 @@ void process_face_crop_and_send(uint32_t frame_id, uint16_t x, uint16_t y,
                  use_w, use_h, crop_len);
         
         // Send the crop via BLE using the image transfer API
-        bool sent = ble_img_xfer_send_rgb565(frame_id,
-                                            use_x, use_y, use_w, use_h,
-                                            crop_buf, crop_len);
+        bool sent = false;
+#if 0
+        sent = ble_img_xfer_send_rgb565(frame_id,
+                                        use_x, use_y, use_w, use_h,
+                                        crop_buf, crop_len);
+#endif
         
         if (sent) {
             ESP_LOGI("IMG_PROC", "Successfully queued crop for BLE transfer");
@@ -386,6 +392,9 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "✅ Media storage ready");
         
+        // Uncomment to wipe all media files on boot.
+        media_delete_all();
+
         // List existing files
         media_list_files();
         
@@ -407,8 +416,10 @@ void app_main(void)
         return;
     }
 
+    // Let the sensor/JPEG pipeline settle before first capture.
+    camera_discard_initial_frames(3);
 
-   // Take one picture and save it via media.c
+    // Take one picture and save it via media.c
     ESP_LOGI(TAG, "Capturing test image...");
     camera_fb_t *test_fb = esp_camera_fb_get();
     if (!test_fb) {
@@ -423,7 +434,6 @@ void app_main(void)
             ESP_LOGI(TAG, "Test capture OK. Check latest photo_* file on SPIFFS.");
         }
     }
-
 
     // Initialize WiFi AP
    // ESP_LOGI(TAG, "Starting WiFi Access Point...");
@@ -449,10 +459,19 @@ void app_main(void)
         return;
 */
 
-    // Initialize BLE
+    // Initialize BLE (disabled for now)
+#if 0
     ESP_LOGI(TAG, "Starting BLE server...");
     ble_server_start("ESP-Face-Detector");
     vTaskDelay(pdMS_TO_TICKS(1000));
+#endif
+
+    // Start WiFi AP + HTTP server on boot
+    ESP_LOGI(TAG, "Starting WiFi AP + HTTP server...");
+    ret = wifi_control_start();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi/HTTP start failed: %s", esp_err_to_name(ret));
+    }
     
     // Initialize face detection
     ESP_LOGI(TAG, "Initializing face detection...");
@@ -462,6 +481,14 @@ void app_main(void)
         return;
     }
     log_memory_usage("AFTER_FACE_DETECT");
+/*
+    // Initialize ML-based hand gesture recognition (camera-based)
+    ESP_LOGI(TAG, "Initializing hand gesture ML...");
+    ret = hand_gesture_ml_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Hand gesture ML init failed: 0x%x", ret);
+    }
+        */
 
     // Create image processing queue
     ESP_LOGI(TAG, "Creating image processing queue...");
@@ -491,7 +518,6 @@ void app_main(void)
     }
     log_memory_usage("AFTER_IMG_TASK");
     // Init I2C bus for power/LEDs
-    // Initialize power / I2C bus (new driver)
     if (power_init() == ESP_OK) {
         uint8_t id;
         power_bq25155_read_id(&id);  // will just warn if not present
@@ -501,7 +527,7 @@ void app_main(void)
     if (leds_init() == ESP_OK) {
         leds_blink_both(2, 100);  // quick sanity blink
     }
-        button_start(system_toggle_idle, system_toggle_wifi, 50, 500, 2000);
+        // button_start(system_toggle_idle, system_toggle_wifi, 50, 500, 2000);
 
     // Initialize gesture sensor LAST
    
@@ -514,8 +540,8 @@ void app_main(void)
             xTaskCreatePinnedToCore(paj7620_task, "paj7620_task", 
                                    4096, NULL, 2, &g_paj_task_handle, 1);
             ESP_LOGI(TAG, "✅ Gesture sensor initialized");
-            ESP_LOGI(TAG, "   FORWARD gesture  = Take photo");
-            ESP_LOGI(TAG, "   BACKWARD gesture = Start/Stop video");
+            ESP_LOGI(TAG, "   CLOCKWISE gesture   = Take photo");
+            ESP_LOGI(TAG, "   ANTICLOCKWISE gesture = Record 10s video");
             ESP_LOGI(TAG, "   UP/DOWN/LEFT/RIGHT = BLE HID (when connected)");
         } else {
             ESP_LOGW(TAG, "Gesture sensor init failed");
@@ -523,10 +549,11 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "Gesture I2C init failed");
     }
+        
     
     log_memory_usage("APP_COMPLETE");
     ESP_LOGI(TAG, "=== Application started successfully ===");
-    ESP_LOGI(TAG, "📸 Photo: FORWARD gesture");
-    ESP_LOGI(TAG, "🎥 Video: BACKWARD gesture (toggle)");
+    ESP_LOGI(TAG, "📸 Photo: CLOCKWISE gesture");
+    ESP_LOGI(TAG, "🎥 Video: ANTICLOCKWISE gesture");
     ESP_LOGI(TAG, "Ready!");
 }

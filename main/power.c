@@ -9,7 +9,7 @@ static const char *TAG = "POWER";
 
 // ------- I2C pins / params (adjust if needed) -------
 #define POWER_I2C_PORT      I2C_NUM_0
-#define POWER_I2C_SDA       2      // same as your demo
+#define POWER_I2C_SDA       2
 #define POWER_I2C_SCL       3
 #define POWER_I2C_FREQ_HZ   100000 // 100 kHz is fine
 

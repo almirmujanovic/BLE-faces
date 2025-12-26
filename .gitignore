@@ -11,3 +11,7 @@ client/*
 
 # But not this specific file
 !folder/ble_client.py
+
+/hand_gesture_recognition
+main/hand_gesture_ml.cpp
+main/include/main_gesture_ml.h

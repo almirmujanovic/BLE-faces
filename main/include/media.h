@@ -14,7 +14,7 @@ esp_err_t media_storage_init(void);
 esp_err_t media_get_storage_info(size_t *total_bytes, size_t *used_bytes, size_t *free_bytes);
 esp_err_t media_list_files(void);
 esp_err_t media_delete_oldest(void);
-static void generate_burst_prefix(char *buf, size_t len);
+esp_err_t media_delete_all(void);
 
 esp_err_t media_save_photo(camera_fb_t *fb);
 

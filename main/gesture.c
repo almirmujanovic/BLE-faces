@@ -449,22 +449,22 @@ static void on_paj_gesture(paj7620_gesture_t g)
 {
     if (g & PAJ7620_GESTURE_CLOCKWISE) {
         // PHOTO (VGA)
-        ESP_LOGI(TAG, "📸 Taking photo (VGA)...");
+        ESP_LOGI(TAG, "Taking photo (VGA)...");
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
             esp_err_t ret = media_save_photo(fb); // media_save_photo should handle VGA now
             esp_camera_fb_return(fb);
             (void)ret;
         } else {
-            ESP_LOGE(TAG, "❌ Camera capture failed");
+            ESP_LOGE(TAG, "Camera capture failed");
         }
         return;
     }
 
     if (g & PAJ7620_GESTURE_ANTICLOCKWISE) {
         // VIDEO (disabled for now, but kept for future)
-        // esp_err_t res = media_capture_jpeg_burst(10000, 20, 200);
-        // (void)res;
+        esp_err_t res = media_capture_jpeg_burst(10000, 10, 120);
+        (void)res;
     }
 
     // BLE HID CONTROLS (only when connected)
@@ -501,3 +501,5 @@ void paj7620_task(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(_gesture_high_rate ? 50 : 100));
     }
 }
+
+

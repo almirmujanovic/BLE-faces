@@ -8,8 +8,8 @@
 
 // I2C Configuration (pins/port now configured in power.c; kept here for reference)
 #define PAJ7620_I2C_NUM         I2C_NUM_0
-#define PAJ7620_I2C_SDA_PIN     21
-#define PAJ7620_I2C_SCL_PIN     20
+#define PAJ7620_I2C_SDA_PIN     2
+#define PAJ7620_I2C_SCL_PIN     3
 #define PAJ7620_I2C_FREQ_HZ     400000  // 400kHz
 
 // DEVICE ID

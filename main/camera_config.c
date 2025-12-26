@@ -66,7 +66,7 @@ esp_err_t init_camera(void)
         .ledc_timer    = LEDC_TIMER_0,
         .ledc_channel  = LEDC_CHANNEL_0,
 
-        .pixel_format  = PIXFORMAT_RGB565,
+        .pixel_format  = PIXFORMAT_YUV422,
         .frame_size    = FRAMESIZE_QVGA,
         .jpeg_quality  = 12,
         .fb_count      = 2,
@@ -95,12 +95,12 @@ esp_err_t init_camera(void)
         /* ---- BASIC, NEUTRAL SETTINGS ---- */
 
   // Make sure we are really RGB565 + VGA
-    s->set_pixformat(s, PIXFORMAT_RGB565);
+    s->set_pixformat(s, PIXFORMAT_YUV422);
     s->set_framesize(s, FRAMESIZE_QVGA);
 
     // ---------- PROFILE A: “balanced defaults” (good starting point) ----------
     // Make sure auto-exposure and auto-gain are ON
-    s->set_exposure_ctrl(s, 1);   // enable AEC (auto exposure)
+    s->set_exposure_ctrl(s, 0);   // enable AEC (auto exposure)
     s->set_ae_level(s, 0);        // tweak -2..2, try 0 or +1 if still dark
     s->set_aec2(s, 1);            // improved AEC if supported
 
@@ -114,7 +114,7 @@ esp_err_t init_camera(void)
 
     // General look
     s->set_brightness(s, 1);      // -2..2   (1 brightens a bit)
-    s->set_contrast(s, 1);        // -2..2
+    s->set_contrast(s, -1);        // -2..2
     s->set_saturation(s, 1);      // -2..2
     s->set_special_effect(s, 0);  // 0 = none (make sure no sepia/negative/etc.)
 
@@ -123,6 +123,8 @@ esp_err_t init_camera(void)
     s->set_bpc(s, 1);             // black pixel correction
     s->set_wpc(s, 1);             // white pixel correction
     s->set_raw_gma(s, 1);         // gamma curve on
+
+
 
 
         ESP_LOGI(TAG, "OV5640 is running ");

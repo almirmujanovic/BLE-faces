@@ -6,6 +6,7 @@ idf_component_register(
         "ble_server.c"
         "ble_image_transfer.c"
         "gesture.c"
+        "hand_gesture_ml.cpp"
         "ble_hid.c"
         "ble_gatts_utils.c"
         "media.c"

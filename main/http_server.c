@@ -278,6 +278,10 @@ static esp_err_t download_handler(httpd_req_t *req)
     } else {
         httpd_resp_set_type(req, "application/octet-stream");
     }
+
+    char content_disp[320];
+    snprintf(content_disp, sizeof(content_disp), "attachment; filename=\"%s\"", filename);
+    httpd_resp_set_hdr(req, "Content-Disposition", content_disp);
     
     // Stream file
     char buf[1024];

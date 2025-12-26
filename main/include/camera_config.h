@@ -24,6 +24,13 @@
 #define CAM_D6_GPIO    12
 #define CAM_D7_GPIO    11
 
+// YUV422 byte order:
+// 0 = YUYV, 1 = UYVY, 2 = YVYU, 3 = VYUY
+#define CAMERA_YUV422_ORDER 1
+
+// RGB565 byte order for ML input: 1 = big-endian, 0 = little-endian
+#define CAMERA_RGB565_BIG_ENDIAN 0
+
 #ifdef __cplusplus
 extern "C" {
 #endif
