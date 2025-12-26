@@ -14,4 +14,4 @@ client/*
 
 /hand_gesture_recognition
 main/hand_gesture_ml.cpp
-main/include/main_gesture_ml.h
+main/include/hand_gesture_ml.h
