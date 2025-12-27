@@ -124,10 +124,12 @@ static const ble_uuid128_t FACE_NOTIFY_UUID =
     BLE_UUID128_INIT(0xf0,0xde,0xac,0xbe,0x00,0x00,0x40,0x00,0x80,0x00,0x00,0xaa,0x00,0x02,0xfa,0x10);
 
 // GATT characteristics
-// --- In your BLE server file (not function-local) ---
+// UUID for CCCD descriptor (must be static, not compound literal)
+static const ble_uuid16_t FACE_CCCD_UUID = BLE_UUID16_INIT(BLE_GATT_DSC_CLT_CFG_UUID16);
+
 static const struct ble_gatt_dsc_def face_notify_descs[] = {
     {
-        .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
+        .uuid = &FACE_CCCD_UUID.u,
         .access_cb = face_notify_desc_cb,
         .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
     },
@@ -166,13 +168,8 @@ static const struct ble_gatt_svc_def g_svcs[] = {
 void ble_send_face_notification(uint32_t frame_id, uint8_t face_count, 
                                 uint16_t x, uint16_t y, uint16_t width, uint16_t height, float confidence)
 {
-    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE || !g_notify_enabled) {
         return; // No connection
-    }
-
-    // Auto-enable notifications to work around Android permission restrictions
-    if (!g_notify_enabled) {
-        g_notify_enabled = true;
     }
 
     face_notification_t notification = {
@@ -228,6 +225,7 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (ev->connect.status == 0) {
             g_conn_handle = ev->connect.conn_handle;
+            g_notify_enabled = false;
             ESP_LOGI(TAG, "Connected, handle=%u", g_conn_handle);
             ESP_LOGI(TAG, "CONNECT status=%d handle=%u", ev->connect.status, ev->connect.conn_handle);
             // Set connection handles for both services
@@ -237,8 +235,14 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
 
             // Initiate security for iOS pairing
             ESP_LOGI(TAG, "Initiating security to force pairing...");
-            if (ble_gap_security_initiate(g_conn_handle) != 0) {
-                ESP_LOGW(TAG, "Security initiate failed");
+            struct ble_gap_conn_desc desc;
+            int rc = ble_gap_conn_find(g_conn_handle, &desc);
+            if (rc == 0 && !desc.sec_state.encrypted) {
+                rc = ble_gap_security_initiate(g_conn_handle);
+                ESP_LOGI(TAG, "Security initiate rc=%d", rc);
+                if (rc != 0) {
+                    ESP_LOGW(TAG, "Security initiate failed");
+                }
             }
         } else {
             ESP_LOGE(TAG, "Connection failed; status=%d", ev->connect.status);
@@ -250,6 +254,8 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
      case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "Disconnected; reason=%d", ev->disconnect.reason);
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        g_notify_enabled = false;
+        ble_hid_set_conn(BLE_HS_CONN_HANDLE_NONE);
         ble_img_xfer_on_disconnect();
         ESP_LOGW(TAG, "DISCONNECT reason=%d", ev->disconnect.reason);
         start_advertising();
@@ -280,11 +286,21 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         if (ev->enc_change.status == 0) {
-            ESP_LOGI(TAG, "🔐 Successfully paired and encrypted!");
+            ESP_LOGI(TAG, "Successfully paired and encrypted");
         } else {
             ESP_LOGW(TAG, "Encryption change failed: %d", ev->enc_change.status);
         }
         break;
+
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        struct ble_gap_conn_desc desc;
+        int rc = ble_gap_conn_find(ev->repeat_pairing.conn_handle, &desc);
+        if (rc == 0) {
+            ESP_LOGW(TAG, "Repeat pairing; deleting old bond");
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
 
     case BLE_GAP_EVENT_NOTIFY_TX:  // resume pumping image chunks when TX frees
         ble_img_xfer_on_notify_tx();                               
@@ -317,7 +333,7 @@ static void start_advertising(void)
 
     // HID appearance (Keyboard or Generic HID both OK)
     adv.appearance_is_present = 1;
-    adv.appearance = 0x03C0; // HID Keyboard (0x03C0 = Generic)
+    adv.appearance = 0x03C1; // HID Keyboard (better iOS compatibility)
 
     // Include BOTH service UUID lists in primary ADV (best for iOS filtering)
     adv.uuids16 = (ble_uuid16_t *)&s_uuid16_hid;
@@ -445,7 +461,7 @@ static void on_sync(void)
         g_own_addr_type = BLE_OWN_ADDR_RANDOM; // last-ditch
     }
 
-    // Log the actual address we’ll use
+    // Log the actual address we'll use
     uint8_t addr_val[6];
     rc = ble_hs_id_copy_addr(g_own_addr_type, addr_val, NULL);
     if (rc == 0) {
@@ -470,10 +486,10 @@ static void ble_start_all(const char *device_name)
     nimble_port_init();
     ble_store_config_init();
 
-        // Require bonding; Just Works (no IO); enable LE Secure Connections
+    // Require bonding; Just Works (no IO)
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm    = 0;   // set 1 if you add passkey/pin UX later
-    ble_hs_cfg.sm_sc      = 1;
+    ble_hs_cfg.sm_sc      = 0;   // disable LE SC to avoid DHKey check failures
     ble_hs_cfg.sm_io_cap  = BLE_HS_IO_NO_INPUT_OUTPUT;
 
     // Distribute encryption and identity keys so iOS will remember you
@@ -481,7 +497,7 @@ static void ble_start_all(const char *device_name)
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
     // Configure NimBLE host callbacks BEFORE the host starts
-    ble_hs_cfg.store_status_cb = NULL;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
     ble_hs_cfg.reset_cb        = on_reset;
     ble_hs_cfg.sync_cb         = on_sync;
 
@@ -495,17 +511,20 @@ static void ble_start_all(const char *device_name)
 
     // 1) Register HID (count + add only)
     ESP_ERROR_CHECK(ble_hid_init());
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     // 2) Register your FACE service (count + add only)
     int rc = ble_gatts_count_cfg(g_svcs);
     assert(rc == 0);
     rc = ble_gatts_add_svcs(g_svcs);
     assert(rc == 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     // (optional) sanity_check_tables(...) + dump_table(...)
 
     // 3) Register IMAGE XFER (count + add only; do not resolve yet)
     ble_img_xfer_init();
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     // Do NOT call ble_gatts_start() here.
     // Do NOT resolve handles here.

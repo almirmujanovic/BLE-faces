@@ -109,23 +109,26 @@ static const struct ble_gatt_svc_def img_svc[] = {
     },
 };
 */
-const struct ble_gatt_dsc_def img_info_descs[] = {
+// UUID for CCCD descriptor (must be static, not compound literal)
+static const ble_uuid16_t UUID_DSC_CCCD = BLE_UUID16_INIT(BLE_GATT_DSC_CLT_CFG_UUID16);
+
+static const struct ble_gatt_dsc_def img_info_descs[] = {
     {
-        .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
+        .uuid = &UUID_DSC_CCCD.u,
         .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
         .access_cb = img_info_access,
     },
     { 0 }
 };
-const struct ble_gatt_dsc_def img_data_descs[] = {
+static const struct ble_gatt_dsc_def img_data_descs[] = {
     {
-        .uuid = BLE_UUID16_DECLARE(BLE_GATT_DSC_CLT_CFG_UUID16),
+        .uuid = &UUID_DSC_CCCD.u,
         .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
         .access_cb = img_data_access,
     },
     { 0 }
 };
-const struct ble_gatt_chr_def img_chrs[] = {
+static const struct ble_gatt_chr_def img_chrs[] = {
     {
         .uuid = &img_rx_uuid.u,
         .access_cb = img_rx_access,
@@ -147,7 +150,7 @@ const struct ble_gatt_chr_def img_chrs[] = {
     },
     { 0 }
 };
-const struct ble_gatt_svc_def img_svc[] = {
+static const struct ble_gatt_svc_def img_svc[] = {
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid = &img_svc_uuid.u,

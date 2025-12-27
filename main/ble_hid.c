@@ -10,7 +10,13 @@
 #include "host/ble_uuid.h"
 #include "host/ble_gatt.h"
 #include "host/ble_store.h"
+
+// NimBLE built-in services (required for iOS HID compatibility)
+#include "services/bas/ble_svc_bas.h"  // Battery Service
+#include "services/dis/ble_svc_dis.h"  // Device Information Service
+
 extern void ble_store_config_init(void);
+
 // ---------- Logging ----------
 static const char *TAG = "HID_CC";
 
@@ -105,27 +111,31 @@ static esp_err_t send_bits_immediate(uint8_t v);
 static esp_err_t cc_tap_bit_immediate(uint8_t bit_index);
 
 // ---------- Descriptors / Characteristics ----------
+// NOTE: BLE_ATT_F_READ/WRITE are REQUIRED to enable access; _ENC variants add encryption requirement
 static const struct ble_gatt_dsc_def s_input_descs[] = {
-    { .uuid = &UUID_DSC_CCCD.u,       .att_flags = BLE_ATT_F_READ_ENC | BLE_ATT_F_WRITE_ENC, .access_cb = hid_access },
-    { .uuid = &UUID_DSC_REPORT_REF.u, .att_flags = BLE_ATT_F_READ,                   .access_cb = hid_access },
+    { .uuid = &UUID_DSC_CCCD.u,       .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE | BLE_ATT_F_READ_ENC | BLE_ATT_F_WRITE_ENC, .access_cb = hid_access },
+    { .uuid = &UUID_DSC_REPORT_REF.u, .att_flags = BLE_ATT_F_READ | BLE_ATT_F_READ_ENC,                   .access_cb = hid_access },
     { 0 }
 };
 
+// NOTE: BLE_GATT_CHR_F_READ is REQUIRED to enable reading; F_READ_ENC adds encryption requirement
 static const struct ble_gatt_chr_def s_hid_chrs[] = {
-    { // Report Map
-      .uuid = &UUID_HID_REPORT_MAP.u, .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ },
+    { // HID Information - must be first for iOS
+      .uuid = &UUID_HID_INFO.u,       .access_cb = hid_access, 
+      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC },
+    { // Report Map - iOS requires encrypted read
+      .uuid = &UUID_HID_REPORT_MAP.u, .access_cb = hid_access, 
+      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC },
+    { // Protocol Mode - iOS requires encryption for writes
+      .uuid = &UUID_HID_PROTO_MODE.u, .access_cb = hid_access,
+      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC },
     { // Input Report (value handle stored for notify)
       .uuid = &UUID_HID_REPORT.u,     .access_cb = hid_access,
-      .flags = BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
+      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
       .val_handle = &s_input_val_handle, .descriptors = s_input_descs },
-    { // HID Information
-      .uuid = &UUID_HID_INFO.u,       .access_cb = hid_access, .flags = BLE_GATT_CHR_F_READ },
-    { // Protocol Mode (Report only; allow write-no-rsp of 0x01)
-      .uuid = &UUID_HID_PROTO_MODE.u, .access_cb = hid_access,
-      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE_NO_RSP },
-    { // Control Point (Suspend/Exit Suspend; accept writes)
+    { // Control Point - iOS requires encrypted write
       .uuid = &UUID_HID_CTRL_POINT.u, .access_cb = hid_access,
-      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP },
+      .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC },
     { 0 }
 };
 
@@ -208,9 +218,19 @@ static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
     return BLE_ATT_ERR_UNLIKELY;
 }
 
-// ---------- Public: register service ----------
+// ---------- Public: register all HID-related services ----------
 esp_err_t ble_hid_init(void)
 {
+    // 1) Initialize NimBLE's built-in Device Information Service (required by iOS for HID)
+    ble_svc_dis_init();
+    ESP_LOGI(TAG, "Device Information Service initialized");
+
+    // 2) Initialize NimBLE's built-in Battery Service (expected by iOS for HID)
+    ble_svc_bas_init();
+    ble_svc_bas_battery_level_set(100);  // Default to 100%
+    ESP_LOGI(TAG, "Battery Service initialized");
+
+    // 3) Register our HID Service
     int rc = ble_gatts_count_cfg(s_hid_svcs);
     if (rc) { ESP_LOGE(TAG, "count_cfg rc=%d", rc); return ESP_FAIL; }
     rc = ble_gatts_add_svcs(s_hid_svcs);
@@ -219,7 +239,7 @@ esp_err_t ble_hid_init(void)
     // Start the HID worker/queue (safe to start early).
     ensure_hid_worker_started();
 
-    ESP_LOGI(TAG, "HID service registered");
+    ESP_LOGI(TAG, "HID service registered (DIS + BAS + HID)");
     return ESP_OK;
 }
 
@@ -234,7 +254,12 @@ esp_err_t ble_hid_get_handles(void)
     return ESP_OK;
 }
 
-void ble_hid_set_conn(uint16_t conn_hdl) { s_conn = conn_hdl; }
+void ble_hid_set_conn(uint16_t conn_hdl) { 
+    s_conn = conn_hdl; 
+    if (conn_hdl == BLE_HS_CONN_HANDLE_NONE) {
+        s_input_notify_en = false;  // Reset notify state on disconnect
+    }
+}
 
 // Map GAP SUBSCRIBE event to local notify flag (NimBLE gives value handle)
 void ble_hid_check_cccd_subscribe(uint16_t attr_handle, uint16_t cur_notify)
