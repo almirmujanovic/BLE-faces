@@ -299,6 +299,8 @@ static void pump_task(void *pvParameters)
 void ble_img_xfer_init(void)
 {
     ESP_LOGI(TAG, "Initializing image transfer service...");
+
+    sanity_check_tables(img_svc);
     
     // Create pump queue and task
     pump_queue = xQueueCreate(10, sizeof(pump_msg_t));

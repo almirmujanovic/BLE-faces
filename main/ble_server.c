@@ -1,7 +1,11 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "esp_err.h"
+#include "esp_system.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_bt.h"
 #include "store/config/ble_store_config.h"
@@ -26,6 +30,21 @@
 extern void ble_store_config_init(void);
 
 static const char *TAG = "BLE_TASK";
+
+// If we reset while connected, clear bond data on next boot.
+#define BLE_CONN_MAGIC 0x434F4E4E
+
+RTC_NOINIT_ATTR static uint32_t s_ble_conn_magic;
+RTC_NOINIT_ATTR static uint32_t s_ble_conn_active;
+
+// Persistent connection flag for power-cycle detection.
+#define BLE_STATE_NS  "ble_state"
+#define BLE_STATE_KEY "conn_active"
+
+static void ble_clear_bonds_on_reset(void);
+static bool ble_get_persisted_conn_active(bool *found);
+static void ble_set_persisted_conn_active(bool active);
+static bool ble_namespace_has_entries(const char *ns);
 
 static void start_advertising(void);
 static int gap_event_cb(struct ble_gap_event *ev, void *arg);
@@ -226,6 +245,8 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
         if (ev->connect.status == 0) {
             g_conn_handle = ev->connect.conn_handle;
             g_notify_enabled = false;
+            s_ble_conn_active = 1;
+            ble_set_persisted_conn_active(true);
             ESP_LOGI(TAG, "Connected, handle=%u", g_conn_handle);
             ESP_LOGI(TAG, "CONNECT status=%d handle=%u", ev->connect.status, ev->connect.conn_handle);
             // Set connection handles for both services
@@ -255,6 +276,8 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
         ESP_LOGI(TAG, "Disconnected; reason=%d", ev->disconnect.reason);
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         g_notify_enabled = false;
+        s_ble_conn_active = 0;
+        ble_set_persisted_conn_active(false);
         ble_hid_set_conn(BLE_HS_CONN_HANDLE_NONE);
         ble_img_xfer_on_disconnect();
         ESP_LOGW(TAG, "DISCONNECT reason=%d", ev->disconnect.reason);
@@ -476,11 +499,126 @@ static void on_sync(void)
     start_advertising();
 }
 
+static void ble_clear_bonds_on_reset(void)
+{
+    static const char *NS_BOND = "nimble_bond";
+    static const char *NS_SVC  = "nimble_svc";
+    bool rtc_conn_active = false;
+    bool nvs_conn_active = false;
+    bool state_found = false;
+
+    if (s_ble_conn_magic == BLE_CONN_MAGIC) {
+        rtc_conn_active = (s_ble_conn_active != 0);
+    } else {
+        s_ble_conn_magic = BLE_CONN_MAGIC;
+        s_ble_conn_active = 0;
+    }
+
+    nvs_conn_active = ble_get_persisted_conn_active(&state_found);
+    if (!state_found) {
+        if (ble_namespace_has_entries(NS_BOND) || ble_namespace_has_entries(NS_SVC)) {
+            ESP_LOGW(TAG, "BLE state flag missing with existing NVS data; clearing for safety");
+            nvs_conn_active = true;
+        }
+    }
+
+    if (!rtc_conn_active && !nvs_conn_active) {
+        return;
+    }
+
+    esp_reset_reason_t reason = esp_reset_reason();
+
+    nvs_handle_t handle;
+    esp_err_t err_bond = nvs_open(NS_BOND, NVS_READWRITE, &handle);
+    if (err_bond == ESP_OK) {
+        err_bond = nvs_erase_all(handle);
+        if (err_bond == ESP_OK) {
+            err_bond = nvs_commit(handle);
+        }
+        nvs_close(handle);
+    }
+
+    esp_err_t err_svc = nvs_open(NS_SVC, NVS_READWRITE, &handle);
+    if (err_svc == ESP_OK) {
+        err_svc = nvs_erase_all(handle);
+        if (err_svc == ESP_OK) {
+            err_svc = nvs_commit(handle);
+        }
+        nvs_close(handle);
+    }
+
+    if (err_bond == ESP_OK && err_svc == ESP_OK) {
+        ESP_LOGW(TAG, "Cleared BLE bond/service store after reset (reason=%d)", reason);
+    } else {
+        if (err_bond != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to clear %s: %s", NS_BOND, esp_err_to_name(err_bond));
+        }
+        if (err_svc != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to clear %s: %s", NS_SVC, esp_err_to_name(err_svc));
+        }
+    }
+
+    s_ble_conn_active = 0;
+    ble_set_persisted_conn_active(false);
+}
+
+static bool ble_get_persisted_conn_active(bool *found)
+{
+    nvs_handle_t handle;
+    uint8_t val = 0;
+    if (found) {
+        *found = false;
+    }
+    esp_err_t err = nvs_open(BLE_STATE_NS, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        err = nvs_get_u8(handle, BLE_STATE_KEY, &val);
+        if (err == ESP_OK && found) {
+            *found = true;
+        }
+        nvs_close(handle);
+    }
+    return val != 0;
+}
+
+static void ble_set_persisted_conn_active(bool active)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(BLE_STATE_NS, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to open %s: %s", BLE_STATE_NS, esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_set_u8(handle, BLE_STATE_KEY, active ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to persist conn_active=%d: %s", active ? 1 : 0, esp_err_to_name(err));
+    }
+    nvs_close(handle);
+}
+
+static bool ble_namespace_has_entries(const char *ns)
+{
+    nvs_iterator_t it = NULL;
+    esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, ns, NVS_TYPE_ANY, &it);
+    if (err == ESP_OK && it != NULL) {
+        nvs_release_iterator(it);
+        return true;
+    }
+    if (it != NULL) {
+        nvs_release_iterator(it);
+    }
+    return false;
+}
+
 
 // Good ble_start_all(): register everything, set callbacks. Do NOT start or resolve yet.
 static void ble_start_all(const char *device_name)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
+    ble_clear_bonds_on_reset();
     esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
 
     nimble_port_init();
@@ -514,6 +652,7 @@ static void ble_start_all(const char *device_name)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // 2) Register your FACE service (count + add only)
+    sanity_check_tables(g_svcs);
     int rc = ble_gatts_count_cfg(g_svcs);
     assert(rc == 0);
     rc = ble_gatts_add_svcs(g_svcs);

@@ -10,6 +10,7 @@
 #include "host/ble_uuid.h"
 #include "host/ble_gatt.h"
 #include "host/ble_store.h"
+#include "ble_gatts_utils.h"
 
 // NimBLE built-in services (required for iOS HID compatibility)
 #include "services/bas/ble_svc_bas.h"  // Battery Service
@@ -221,6 +222,7 @@ static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
 // ---------- Public: register all HID-related services ----------
 esp_err_t ble_hid_init(void)
 {
+    sanity_check_tables(s_hid_svcs);
     // 1) Initialize NimBLE's built-in Device Information Service (required by iOS for HID)
     ble_svc_dis_init();
     ESP_LOGI(TAG, "Device Information Service initialized");
