@@ -481,14 +481,12 @@ void app_main(void)
         return;
     }
     log_memory_usage("AFTER_FACE_DETECT");
-/*
     // Initialize ML-based hand gesture recognition (camera-based)
     ESP_LOGI(TAG, "Initializing hand gesture ML...");
     ret = hand_gesture_ml_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Hand gesture ML init failed: 0x%x", ret);
     }
-        */
 
     // Create image processing queue
     ESP_LOGI(TAG, "Creating image processing queue...");
