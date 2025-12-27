@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_log.h"
@@ -549,8 +550,9 @@ void app_main(void)
 
     // Create face detection task
     ESP_LOGI(TAG, "Creating face detection task...");
-    BaseType_t ok = xTaskCreate(face_detection_task, "face_detection_task", 
-                               8192, NULL, 6, &g_face_task_handle);
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(face_detection_task, "face_detection_task",
+                               8192, NULL, 6, &g_face_task_handle,
+                               tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create face_detection_task");
         return;
@@ -559,8 +561,9 @@ void app_main(void)
 
     // Create image processing task
     ESP_LOGI(TAG, "Creating image processing task...");
-    ok = xTaskCreate(image_processing_task, "image_processing_task", 
-                    16384, NULL, 4, &g_img_task_handle);
+    ok = xTaskCreatePinnedToCoreWithCaps(image_processing_task, "image_processing_task",
+                    16384, NULL, 4, &g_img_task_handle,
+                    tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create image_processing_task");
         return;

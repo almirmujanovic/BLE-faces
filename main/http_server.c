@@ -9,6 +9,12 @@
 
 static const char *TAG = "HTTP_SERVER";
 #define MEDIA_MOUNT_POINT "/media"
+#define MEDIA_PATH_MAX 256
+#define MEDIA_NAME_MAX 200
+#define HTML_NAME_MAX 80
+#define ITEM_HTML_MAX 512
+#define CONTENT_DISP_MAX 256
+#define CONTENT_DISP_NAME_MAX 200
 
 // HTML header/footer for consistent styling
 static const char *html_header = 
@@ -148,8 +154,9 @@ static esp_err_t images_handler(httpd_req_t *req)
             if (entry->d_type == DT_REG && 
                 (strstr(entry->d_name, ".jpg") || strstr(entry->d_name, ".jpeg"))) {
                 
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), MEDIA_MOUNT_POINT "/%s", entry->d_name);
+                char filepath[MEDIA_PATH_MAX];
+                snprintf(filepath, sizeof(filepath), MEDIA_MOUNT_POINT "/%.*s",
+                         MEDIA_NAME_MAX, entry->d_name);
                 
                 struct stat st;
                 char size_str[32] = "Unknown";
@@ -157,15 +164,17 @@ static esp_err_t images_handler(httpd_req_t *req)
                     format_size(st.st_size, size_str, sizeof(size_str));
                 }
                 
-                char item_html[2048];  // Increased from 1024 to 2048
+                char item_html[ITEM_HTML_MAX];
                 snprintf(item_html, sizeof(item_html),
                          "<div class='media-item'>"
-                         "<img src='/download?file=%s' alt='%s' loading='lazy'>"
-                         "<a href='/download?file=%s'>%s</a>"
-                         "<div class='size'>%s</div>"
+                         "<img src='/download?file=%.*s' alt='%.*s' loading='lazy'>"
+                         "<a href='/download?file=%.*s'>%.*s</a>"
+                         "<div class='size'>%.31s</div>"
                          "</div>",
-                         entry->d_name, entry->d_name,
-                         entry->d_name, entry->d_name,
+                         HTML_NAME_MAX, entry->d_name,
+                         HTML_NAME_MAX, entry->d_name,
+                         HTML_NAME_MAX, entry->d_name,
+                         HTML_NAME_MAX, entry->d_name,
                          size_str);
                 
                 httpd_resp_sendstr_chunk(req, item_html);
@@ -206,8 +215,9 @@ static esp_err_t videos_handler(httpd_req_t *req)
                 (strstr(entry->d_name, ".avi") || strstr(entry->d_name, ".mjpg"))) {  // Added .avi
 
                 
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), MEDIA_MOUNT_POINT "/%s", entry->d_name);
+                char filepath[MEDIA_PATH_MAX];
+                snprintf(filepath, sizeof(filepath), MEDIA_MOUNT_POINT "/%.*s",
+                         MEDIA_NAME_MAX, entry->d_name);
                 
                 struct stat st;
                 char size_str[32] = "Unknown";
@@ -215,14 +225,15 @@ static esp_err_t videos_handler(httpd_req_t *req)
                     format_size(st.st_size, size_str, sizeof(size_str));
                 }
                 
-                char item_html[2048];  // Increased from 1024 to 2048
+                char item_html[ITEM_HTML_MAX];
                 snprintf(item_html, sizeof(item_html),
                          "<div class='media-item'>"
                          "🎬"
-                         "<a href='/download?file=%s'>%s</a>"
-                         "<div class='size'>%s</div>"
+                         "<a href='/download?file=%.*s'>%.*s</a>"
+                         "<div class='size'>%.31s</div>"
                          "</div>",
-                         entry->d_name, entry->d_name,
+                         HTML_NAME_MAX, entry->d_name,
+                         HTML_NAME_MAX, entry->d_name,
                          size_str);
                 
                 httpd_resp_sendstr_chunk(req, item_html);
@@ -261,8 +272,9 @@ static esp_err_t download_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     
-    char filepath[512];
-    snprintf(filepath, sizeof(filepath), MEDIA_MOUNT_POINT "/%s", filename);
+    char filepath[MEDIA_PATH_MAX];
+    snprintf(filepath, sizeof(filepath), MEDIA_MOUNT_POINT "/%.*s",
+             MEDIA_NAME_MAX, filename);
     
     FILE *f = fopen(filepath, "rb");
     if (!f) {
@@ -281,8 +293,9 @@ static esp_err_t download_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/octet-stream");
     }
 
-    char content_disp[320];
-    snprintf(content_disp, sizeof(content_disp), "attachment; filename=\"%s\"", filename);
+    char content_disp[CONTENT_DISP_MAX];
+    snprintf(content_disp, sizeof(content_disp), "attachment; filename=\"%.*s\"",
+             CONTENT_DISP_NAME_MAX, filename);
     httpd_resp_set_hdr(req, "Content-Disposition", content_disp);
     
     // Stream file
@@ -307,11 +320,13 @@ httpd_handle_t start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 8;
-    config.stack_size = 8192;  // Increase from default 4096 to 8192
+    config.max_uri_handlers = 6;
+    config.max_open_sockets = 4;
+    config.stack_size = 4096;  // keep in internal RAM (SPIFFS reads disable cache)
     config.task_priority = 5;  // Lower priority to avoid mutex conflicts
     config.core_id = 1;        // Pin to Core 1
     config.lru_purge_enable = true;
+    config.task_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     
     httpd_handle_t server = NULL;
     esp_err_t err = httpd_start(&server, &config);
@@ -321,9 +336,9 @@ httpd_handle_t start_http_server(void)
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         if (err == ESP_ERR_NO_MEM || err == ESP_ERR_HTTPD_TASK) {
-            config.stack_size = 4096;
-            config.max_open_sockets = 4;
-            config.max_uri_handlers = 6;
+            config.stack_size = 3072;
+            config.max_open_sockets = 3;
+            config.max_uri_handlers = 5;
             config.core_id = tskNO_AFFINITY;
             err = httpd_start(&server, &config);
             if (err != ESP_OK) {
