@@ -6,7 +6,6 @@ idf_component_register(
         "ble_server.c"
         "ble_image_transfer.c"
         "gesture.c"
-        "hand_gesture_ml.cpp"
         "ble_hid.c"
         "ble_gatts_utils.c"
         "media.c"
@@ -15,7 +14,6 @@ idf_component_register(
         "power.c"
         "button.c"
         "wifi_control.c"
-        "system_state.c"
     INCLUDE_DIRS
         "." "include"
     REQUIRES

@@ -12,153 +12,52 @@
 #include "include/ble_server.h"
 #include "include/ble_image_transfer.h"
 #include "include/gesture.h"
-#include "include/hand_gesture_ml.h"
 #include "include/media.h"
 #include "include/leds.h"
 #include "include/power.h"
-#include "include/system_state.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
-#include "spi_flash_mmap.h"
 #include <lwip/inet.h>
 #include "leds.h"
 #include "button.h"
 #include "wifi_control.h"
+#include "spi_flash_mmap.h"  // For cache operations
+
 static const char *TAG = "BLE_FACES";
 
+static bool g_system_idle = false;
 static TaskHandle_t g_face_task_handle = NULL;
 static TaskHandle_t g_img_task_handle  = NULL;
 static TaskHandle_t g_paj_task_handle  = NULL;
-static bool g_idle_transition = false;
-static bool g_wifi_was_running = false;
-// toggles idle: pause camera/ML/gesture and restore on resume
+// Simulate idle mode with LED feedback only (no actual suspend)
 static void system_toggle_idle(void)
 {
-    if (g_idle_transition) {
-        ESP_LOGW(TAG, "IDLE transition already in progress");
-        return;
-    }
-    g_idle_transition = true;
-
-    if (!system_is_idle()) {
-        ESP_LOGI(TAG, "Entering IDLE: pausing camera, ML, and gesture sensor...");
-        system_set_idle(true);
-
-        g_wifi_was_running = wifi_control_is_running();
-        if (g_wifi_was_running) {
-            wifi_control_stop();
-            ESP_LOGI(TAG, "WiFi/server stopped as part of IDLE");
-        }
-
-        uint32_t pause_mask = 0;
-        if (g_face_task_handle) {
-            pause_mask |= SYSTEM_TASK_FACE;
-        }
-        if (g_paj_task_handle) {
-            pause_mask |= SYSTEM_TASK_GESTURE;
-        }
-
-        if (pause_mask) {
-            const uint32_t wait_step_ms = 50;
-            uint32_t waited_ms = 0;
-            while (!system_are_tasks_paused(pause_mask) && waited_ms < 5000) {
-                vTaskDelay(pdMS_TO_TICKS(wait_step_ms));
-                waited_ms += wait_step_ms;
-            }
-            if (!system_are_tasks_paused(pause_mask)) {
-                ESP_LOGE(TAG, "Timeout waiting for tasks to pause (mask=0x%02X)", (unsigned)pause_mask);
-                system_set_idle(false);
-                if (g_wifi_was_running) {
-                    esp_err_t werr = wifi_control_start();
-                    if (werr != ESP_OK) {
-                        ESP_LOGW(TAG, "WiFi/HTTP restart failed after IDLE abort: %s", esp_err_to_name(werr));
-                    }
-                    g_wifi_was_running = false;
-                }
-                g_idle_transition = false;
-                return;
-            }
-        }
-
-        uint32_t busy_wait_ms = 0;
-        while (media_is_camera_busy() && busy_wait_ms < 5000) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            busy_wait_ms += 100;
-        }
-        if (media_is_camera_busy()) {
-            ESP_LOGW(TAG, "Camera still busy; proceeding with idle transition");
-        }
-
-        esp_err_t err = paj7620_deinit();
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "paj7620_deinit failed: %s", esp_err_to_name(err));
-        }
-
-        ESP_LOGI(TAG, "Keeping camera driver initialized to preserve shared I2C");
-
-        leds_blink_idle(3, 150);
-        leds_set_idle(true);
-
-        ESP_LOGI(TAG, "System entered IDLE (camera/ML/gesture paused)");
+    if (!g_system_idle) {
+        // Entering IDLE mode - just flash capture LED (EIO3) 5 times
+        ESP_LOGI(TAG, "Simulating IDLE mode entry...");
+        leds_blink_capture(5, 100);
+        g_system_idle = true;
+        ESP_LOGI(TAG, "IDLE mode simulated (LED feedback only, system still running)");
     } else {
-        ESP_LOGI(TAG, "Exiting IDLE: resuming camera, ML, and gesture sensor...");
-
-        esp_err_t err = paj7620_i2c_init();
-        if (err == ESP_OK) {
-            err = paj7620_init();
-            if (err == ESP_OK) {
-                paj7620_set_high_rate(true);
-            } else {
-                ESP_LOGW(TAG, "Gesture sensor init failed: %s", esp_err_to_name(err));
-            }
-        } else {
-            ESP_LOGW(TAG, "Gesture I2C init failed: %s", esp_err_to_name(err));
-        }
-
-        leds_configure_button_input();
-
-        camera_discard_initial_frames(3);
-        vTaskDelay(pdMS_TO_TICKS(50));
-
-        system_set_idle(false);
-
-        if (g_wifi_was_running) {
-            esp_err_t werr = wifi_control_start();
-            if (werr != ESP_OK) {
-                ESP_LOGW(TAG, "WiFi/HTTP restart failed after IDLE: %s", esp_err_to_name(werr));
-            }
-            g_wifi_was_running = false;
-        }
-
-        leds_blink_idle(2, 150);
-        leds_set_idle(false);
-        ESP_LOGI(TAG, "System resumed from IDLE");
+        // Exiting IDLE mode - just flash idle LED (EIO0) 5 times
+        ESP_LOGI(TAG, "Simulating IDLE mode exit...");
+        leds_blink_idle(5, 100);
+        g_system_idle = false;
+        ESP_LOGI(TAG, "Exited IDLE mode simulation");
     }
-
-    g_idle_transition = false;
 }
 
 // toggles wifi/server on button hold
 static void system_toggle_wifi(void)
 {
-    if (system_is_idle()) {
-        ESP_LOGW(TAG, "Ignoring WiFi toggle while IDLE");
-        return;
-    }
     if (wifi_control_is_running()) {
         wifi_control_stop();
-        leds_blink_alternate(2, 80);
         ESP_LOGI(TAG, "WiFi + HTTP server stopped by button hold");
     } else {
         esp_err_t r = wifi_control_start();
         if (r == ESP_OK) {
-            leds_blink_both(2, 80);
-            if (wifi_control_get_server_handle()) {
-                ESP_LOGI(TAG, "WiFi + HTTP server started by button hold");
-            } else {
-                ESP_LOGW(TAG, "WiFi started, but HTTP server failed to start");
-            }
+            ESP_LOGI(TAG, "WiFi + HTTP server started by button hold");
         } else {
             ESP_LOGW(TAG, "Failed to start WiFi via button hold: %s", esp_err_to_name(r));
         }
@@ -268,7 +167,6 @@ void process_face_crop_and_send(uint32_t frame_id, uint16_t x, uint16_t y,
              w, h, x, y, img_width, img_height);
     
     // Send the notification (lightweight)
-
     ble_send_face_notification(frame_id, 1, x, y, w, h, confidence);
     
     // Do heavy image processing here (safe with large stack)
@@ -285,12 +183,9 @@ void process_face_crop_and_send(uint32_t frame_id, uint16_t x, uint16_t y,
                  use_w, use_h, crop_len);
         
         // Send the crop via BLE using the image transfer API
-        bool sent = false;
-
-        sent = ble_img_xfer_send_rgb565(frame_id,
-                                        use_x, use_y, use_w, use_h,
-                                        crop_buf, crop_len);
-
+        bool sent = ble_img_xfer_send_rgb565(frame_id,
+                                            use_x, use_y, use_w, use_h,
+                                            crop_buf, crop_len);
         
         if (sent) {
             ESP_LOGI("IMG_PROC", "Successfully queued crop for BLE transfer");
@@ -421,13 +316,13 @@ static void wifi_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
     
-    ESP_LOGI("WIFI", "WiFi AP started");
+    ESP_LOGI("WIFI", "✅ WiFi AP started");
     ESP_LOGI("WIFI", "   SSID: ESP32-Media");
     ESP_LOGI("WIFI", "   Password: 12345678");
     ESP_LOGI("WIFI", "   IP Address: http://192.168.1.100");
     ESP_LOGI("WIFI", "   Browse media at:");
-    ESP_LOGI("WIFI", "     - http://192.168.1.100/images");
-    ESP_LOGI("WIFI", "     - http://192.168.1.100/videos");
+    ESP_LOGI("WIFI", "     • http://192.168.1.100/images");
+    ESP_LOGI("WIFI", "     • http://192.168.1.100/videos");
 }
 
 
@@ -444,42 +339,39 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Start BLE early to avoid SPI flash cache contention during SPIFFS I/O.
-    ESP_LOGI(TAG, "Starting BLE server (early)...");
+    // ========== FIX 1: START BLE FIRST (before any heavy SPIFFS operations) ==========
+    // This ensures BLE's flash-resident code is accessed before SPIFFS I/O can destabilize cache
+    ESP_LOGI(TAG, "Starting BLE server (before flash-heavy operations)...");
     ble_server_start("ESP-Face-Detector");
-    vTaskDelay(pdMS_TO_TICKS(500));
-    ESP_LOGI(TAG, "BLE server started");
+    vTaskDelay(pdMS_TO_TICKS(500));  // Let BLE stabilize
+    ESP_LOGI(TAG, "✅ BLE server started");
 
-
-    // Initialize media storage (BEFORE gesture sensor)
+    // ========== NOW do media/camera init (after BLE is stable) ==========
     ESP_LOGI(TAG, "Initializing media storage...");
     ret = media_storage_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Media storage init failed: %s", esp_err_to_name(ret));
         ESP_LOGW(TAG, "Photo/video capture will not work");
     } else {
-        ESP_LOGI(TAG, "Media storage ready");
+        ESP_LOGI(TAG, "✅ Media storage ready");
         
-        // Uncomment to wipe all media files on boot.
-        // media_delete_all();
-
         // List existing files
         media_list_files();
         
         // Get storage info
-        size_t total, used, free;
-        if (media_get_storage_info(&total, &used, &free) == ESP_OK) {
+        size_t total, used, free_space;
+        if (media_get_storage_info(&total, &used, &free_space) == ESP_OK) {
             ESP_LOGI(TAG, "Storage: %zu KB total, %zu KB used, %zu KB free", 
-                     total/1024, used/1024, free/1024);
+                     total/1024, used/1024, free_space/1024);
         }
     }
     
     log_memory_usage("AFTER_MEDIA_STORAGE");
 
+    // ========== FIX 2: Cache stabilization delay after SPIFFS operations ==========
     ESP_LOGI(TAG, "Allowing flash cache to stabilize...");
-    spi_flash_mmap_dump();
+    spi_flash_mmap_dump();  // Force cache sync
     vTaskDelay(pdMS_TO_TICKS(200));
-
 
     ESP_LOGI(TAG, "Initializing camera...");
     ret = init_camera();
@@ -488,42 +380,30 @@ void app_main(void)
         return;
     }
 
-    // Let the sensor/JPEG pipeline settle before first capture.
-    camera_discard_initial_frames(3);
+    // ========== FIX 3: Skip test capture on boot (causes flash cache issues) ==========
+    // Test capture is disabled to prevent SPIFFS writes before BLE is fully operational
+    // Photos will be taken when explicitly requested via gestures or BLE commands
+#if 0  // DISABLED - uncomment to enable test capture
+    ESP_LOGI(TAG, "Capturing test image...");
+    camera_fb_t *test_fb = esp_camera_fb_get();
+    if (!test_fb) {
+        ESP_LOGE(TAG, "Test capture failed: no frame buffer");
+    } else {
+        ret = media_save_photo(test_fb);
+        esp_camera_fb_return(test_fb);
 
-
-    // Initialize WiFi AP
-   // ESP_LOGI(TAG, "Starting WiFi Access Point...");
-  //  wifi_init();
-    
-    // Start HTTP server for media access
-   // ESP_LOGI(TAG, "Starting HTTP file server...");
-    //httpd_handle_t server = start_http_server();
-    //if (server) {
-     //   ESP_LOGI(TAG, "HTTP server running at http://192.168.1.100/");
-       // ESP_LOGI(TAG, "   Connect to WiFi: SSID='ESP32-Media', Password='12345678'");
-   // } else {
-     //   ESP_LOGW(TAG, "Failed to start HTTP server");
-    //}
-
-    /*
-    esp_err_t res = media_capture_jpeg_burst(10000, 20, 200);
-        if (res == ESP_OK) {
-            ESP_LOGI(TAG, "Captured burst video (VGA) for %d ms at %d FPS", 10000, 20);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Test capture failed: 0x%x", ret);
         } else {
-            ESP_LOGE(TAG, "Burst video capture failed: %s", esp_err_to_name(res));
+            ESP_LOGI(TAG, "Test capture OK. Check latest photo_* file on SPIFFS.");
         }
-        return;
-*/
+        
+        // FIX 4: Force cache sync after any SPIFFS write
+        spi_flash_mmap_dump();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+#endif
 
-    /*
-    // Start WiFi AP + HTTP server on boot
-    ESP_LOGI(TAG, "Starting WiFi AP + HTTP server...");
-    ret = wifi_control_start();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "WiFi/HTTP start failed: %s", esp_err_to_name(ret));
-    }*/
-    
     // Initialize face detection
     ESP_LOGI(TAG, "Initializing face detection...");
     ret = init_face_detection();
@@ -532,12 +412,6 @@ void app_main(void)
         return;
     }
     log_memory_usage("AFTER_FACE_DETECT");
-    // Initialize ML-based hand gesture recognition (camera-based)
-    ESP_LOGI(TAG, "Initializing hand gesture ML...");
-    ret = hand_gesture_ml_init();
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Hand gesture ML init failed: 0x%x", ret);
-    }
 
     // Create image processing queue
     ESP_LOGI(TAG, "Creating image processing queue...");
@@ -567,6 +441,7 @@ void app_main(void)
     }
     log_memory_usage("AFTER_IMG_TASK");
     // Init I2C bus for power/LEDs
+    // Initialize power / I2C bus (new driver)
     if (power_init() == ESP_OK) {
         uint8_t id;
         power_bq25155_read_id(&id);  // will just warn if not present
@@ -588,9 +463,9 @@ void app_main(void)
             paj7620_set_high_rate(true);
             xTaskCreatePinnedToCore(paj7620_task, "paj7620_task", 
                                    4096, NULL, 2, &g_paj_task_handle, 1);
-            ESP_LOGI(TAG, "Gesture sensor initialized");
-            ESP_LOGI(TAG, "   CLOCKWISE gesture   = Take photo");
-            ESP_LOGI(TAG, "   ANTICLOCKWISE gesture = Record 10s video");
+            ESP_LOGI(TAG, "✅ Gesture sensor initialized");
+            ESP_LOGI(TAG, "   FORWARD gesture  = Take photo");
+            ESP_LOGI(TAG, "   BACKWARD gesture = Start/Stop video");
             ESP_LOGI(TAG, "   UP/DOWN/LEFT/RIGHT = BLE HID (when connected)");
         } else {
             ESP_LOGW(TAG, "Gesture sensor init failed");
@@ -598,11 +473,10 @@ void app_main(void)
     } else {
         ESP_LOGW(TAG, "Gesture I2C init failed");
     }
-        
     
     log_memory_usage("APP_COMPLETE");
     ESP_LOGI(TAG, "=== Application started successfully ===");
-    ESP_LOGI(TAG, "Photo: CLOCKWISE gesture");
-    ESP_LOGI(TAG, "Video: ANTICLOCKWISE gesture");
+    ESP_LOGI(TAG, "📸 Photo: FORWARD gesture");
+    ESP_LOGI(TAG, "🎥 Video: BACKWARD gesture (toggle)");
     ESP_LOGI(TAG, "Ready!");
 }

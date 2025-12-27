@@ -8,6 +8,7 @@
 #include <string.h>
 #include "camera_config.h"
 #include "include/media.h"
+#include "include/system_state.h"
 
 static const char *TAG = "FACE_DETECT";
 static HumanFaceDetect *face_detector = nullptr;
@@ -103,6 +104,12 @@ esp_err_t init_face_detection(void)
     return ESP_OK;
 }
 
+void face_detection_deinit(void)
+{
+    delete face_detector;
+    face_detector = nullptr;
+}
+
 face_detection_result_t* detect_faces(camera_fb_t* fb)
 {
     if (!face_detector || !fb) {
@@ -166,11 +173,25 @@ void face_detection_task(void *pvParameter)
     uint32_t capture_failures = 0;
     uint32_t faces_detected_total = 0;
     const uint32_t hand_gesture_every_n = 3;
+    bool was_idle = false;
     
     ESP_LOGI(TAG, "Face detection task started - waiting for camera stabilization...");
     vTaskDelay(pdMS_TO_TICKS(3000));
     
     for (;;) {
+        if (system_is_idle()) {
+            if (!was_idle) {
+                system_mark_task_paused(SYSTEM_TASK_FACE, true);
+                was_idle = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+        if (was_idle) {
+            system_mark_task_paused(SYSTEM_TASK_FACE, false);
+            was_idle = false;
+        }
+
         if (media_is_camera_busy()) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;

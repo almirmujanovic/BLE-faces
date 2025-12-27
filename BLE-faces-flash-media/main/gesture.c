@@ -8,7 +8,6 @@
 #include <string.h>
 #include "ble_hid.h"
 #include "media.h"
-#include "include/system_state.h"
 
 static const char *TAG = "PAJ7620";
 
@@ -242,22 +241,67 @@ static const uint8_t init_register_array[][2] = {
     {0x7E,0x01}
 };
 
-// Write a single byte to PAJ7620 register
+// I2C timeout in ms (-1 = default, but we want explicit timeout for stability)
+#define PAJ7620_I2C_TIMEOUT_MS  100
+
+// Write a single byte to PAJ7620 register with explicit timeout
 static esp_err_t paj7620_write_reg(uint8_t reg, uint8_t data) {
     if (!paj7620_dev_handle) return ESP_ERR_INVALID_STATE;
     uint8_t write_buf[2] = {reg, data};
-    return i2c_master_transmit(paj7620_dev_handle, write_buf, 2, -1);
+    esp_err_t ret = i2c_master_transmit(paj7620_dev_handle, write_buf, 2, PAJ7620_I2C_TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG, "I2C write failed: reg=0x%02X, data=0x%02X, err=%s", reg, data, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
-// Read bytes from PAJ7620 register
+// Read bytes from PAJ7620 register with explicit timeout
 static esp_err_t paj7620_read_reg(uint8_t reg, uint8_t *data, size_t len) {
     if (!paj7620_dev_handle) return ESP_ERR_INVALID_STATE;
-    return i2c_master_transmit_receive(paj7620_dev_handle, &reg, 1, data, len, -1);
+    esp_err_t ret = i2c_master_transmit_receive(paj7620_dev_handle, &reg, 1, data, len, PAJ7620_I2C_TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG, "I2C read failed: reg=0x%02X, len=%d, err=%s", reg, (int)len, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
-// Select register bank
+// Select register bank (with short delay for stability)
 static esp_err_t paj7620_select_bank(paj7620_bank_t bank) {
-    return paj7620_write_reg(PAJ7620_REGITER_BANK_SEL, (uint8_t)bank);
+    esp_err_t ret = paj7620_write_reg(PAJ7620_REGITER_BANK_SEL, (uint8_t)bank);
+    if (ret == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(1)); // Short delay after bank switch
+    }
+    return ret;
+}
+
+// Wakeup the sensor - first I2C transaction wakes the device but is NOT processed
+// Must send bank select TWICE: first to wake, second to actually select
+static esp_err_t paj7620_wakeup(void) {
+    if (!paj7620_dev_handle) return ESP_ERR_INVALID_STATE;
+    
+    ESP_LOGI(TAG, "Sending wakeup sequence...");
+    
+    // Method 1: Send dummy bank select command to wake up the device
+    // This transaction wakes the sensor but the command itself is ignored
+    uint8_t wakeup_cmd[2] = {PAJ7620_REGITER_BANK_SEL, 0x00};
+    esp_err_t ret = i2c_master_transmit(paj7620_dev_handle, wakeup_cmd, 2, PAJ7620_I2C_TIMEOUT_MS);
+    
+    // The wakeup transaction may fail with NACK - that's expected if sensor is in deep sleep
+    // We don't check the return value here
+    (void)ret;
+    
+    // Wait for sensor to wake up (datasheet recommends ~700us, we use 5ms for safety)
+    vTaskDelay(pdMS_TO_TICKS(5));
+    
+    // Now send the real bank select command - this one should be processed
+    ret = paj7620_select_bank(PAJ7620_BANK0);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Second bank select failed, retrying after longer delay...");
+        vTaskDelay(pdMS_TO_TICKS(50));
+        ret = paj7620_select_bank(PAJ7620_BANK0);
+    }
+    
+    return ret;
 }
 
 // ------------------------------------------------------
@@ -302,73 +346,86 @@ esp_err_t paj7620_i2c_init(void) {
     return ESP_OK;
 }
 
+#define PAJ7620_INIT_MAX_RETRIES 5
+#define PAJ7620_RETRY_DELAY_MS   300
+
 esp_err_t paj7620_init(void) {
-    esp_err_t ret;
+    esp_err_t ret = ESP_FAIL;
     uint8_t part_id[2];
 
-    // Wait for sensor to wake up
-    vTaskDelay(pdMS_TO_TICKS(800));
-
-    // Select Bank 0
-    ret = paj7620_select_bank(PAJ7620_BANK0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to select bank 0");
-        return ret;
-    }
-
-    // Read Part ID (2 bytes)
-    ret = paj7620_read_reg(PAJ7620_ADDR_PART_ID_LOW, part_id, 2);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read Part ID");
-        return ret;
-    }
-
-    uint16_t pid = part_id[0] | (part_id[1] << 8);
-    ESP_LOGI(TAG, "Part ID: 0x%04X", pid);
-
-    if (pid != PAJ7620_PARTID) {
-        ESP_LOGE(TAG, "Invalid Part ID! Expected 0x%04X, got 0x%04X",
-                 PAJ7620_PARTID, pid);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // Write initialization array
-    size_t init_array_size = sizeof(init_register_array) / sizeof(init_register_array[0]);
-    ESP_LOGI(TAG, "Writing %d initialization registers...", (int)init_array_size);
-
-    for (size_t i = 0; i < init_array_size; i++) {
-        ret = paj7620_write_reg(init_register_array[i][0], init_register_array[i][1]);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to write init register %d (reg=0x%02X)", (int)i,
-                     init_register_array[i][0]);
-            return ret;
+    // Full initialization with retry logic
+    for (int attempt = 1; attempt <= PAJ7620_INIT_MAX_RETRIES; attempt++) {
+        ESP_LOGI(TAG, "PAJ7620 init attempt %d/%d", attempt, PAJ7620_INIT_MAX_RETRIES);
+        
+        // Step 1: Wait for sensor power-up (first attempt needs longer delay)
+        if (attempt == 1) {
+            vTaskDelay(pdMS_TO_TICKS(700));  // Initial power-up delay per datasheet
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(PAJ7620_RETRY_DELAY_MS));
         }
-    }
-
-    // Select Bank 0 for gesture reading
-    ret = paj7620_select_bank(PAJ7620_BANK0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to select bank 0");
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "PAJ7620 initialized successfully");
-    return ESP_OK;
-}
-
-esp_err_t paj7620_deinit(void)
-{
-    if (!paj7620_dev_handle) {
+        
+        // Step 2: Wakeup sequence (sends bank select twice - first wakes, second processes)
+        ret = paj7620_wakeup();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Wakeup failed on attempt %d: %s", attempt, esp_err_to_name(ret));
+            continue;  // Retry
+        }
+        
+        // Step 3: Read and verify Part ID
+        ret = paj7620_read_reg(PAJ7620_ADDR_PART_ID_LOW, part_id, 2);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to read Part ID on attempt %d: %s", attempt, esp_err_to_name(ret));
+            continue;  // Retry
+        }
+        
+        uint16_t pid = part_id[0] | (part_id[1] << 8);
+        ESP_LOGI(TAG, "Part ID: 0x%04X", pid);
+        
+        if (pid != PAJ7620_PARTID) {
+            ESP_LOGW(TAG, "Invalid Part ID on attempt %d: expected 0x%04X, got 0x%04X",
+                     attempt, PAJ7620_PARTID, pid);
+            ret = ESP_ERR_NOT_FOUND;
+            continue;  // Retry
+        }
+        
+        // Step 4: Write initialization array
+        size_t init_array_size = sizeof(init_register_array) / sizeof(init_register_array[0]);
+        ESP_LOGI(TAG, "Writing %d initialization registers...", (int)init_array_size);
+        
+        bool init_success = true;
+        for (size_t i = 0; i < init_array_size; i++) {
+            ret = paj7620_write_reg(init_register_array[i][0], init_register_array[i][1]);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to write reg %d (0x%02X) on attempt %d", 
+                         (int)i, init_register_array[i][0], attempt);
+                init_success = false;
+                break;
+            }
+            // Small delay every 20 registers to prevent I2C bus overload
+            if (i > 0 && (i % 20) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
+        
+        if (!init_success) {
+            continue;  // Retry full init
+        }
+        
+        // Step 5: Select Bank 0 for gesture reading
+        vTaskDelay(pdMS_TO_TICKS(10));  // Short delay after init sequence
+        ret = paj7620_select_bank(PAJ7620_BANK0);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Final bank select failed on attempt %d", attempt);
+            continue;  // Retry
+        }
+        
+        // Success!
+        ESP_LOGI(TAG, "✅ PAJ7620 initialized successfully on attempt %d", attempt);
         return ESP_OK;
     }
-
-    esp_err_t err = i2c_master_bus_rm_device(paj7620_dev_handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to remove PAJ7620 device: %s", esp_err_to_name(err));
-    }
-    paj7620_dev_handle = NULL;
-    _current_gesture = PAJ7620_GESTURE_NONE;
-    return err;
+    
+    ESP_LOGE(TAG, "❌ PAJ7620 initialization failed after %d attempts", PAJ7620_INIT_MAX_RETRIES);
+    return ret;
 }
 
 void paj7620_set_high_rate(bool high_rate) {
@@ -378,9 +435,14 @@ void paj7620_set_high_rate(bool high_rate) {
 paj7620_gesture_t paj7620_get_gesture(void) {
     uint8_t data_flag1 = 0;
     uint8_t data_flag0 = 0;
+    esp_err_t ret;
 
     // Read FLAG_1 first (for wave detection)
-    paj7620_read_reg(PAJ7620_ADDR_GES_PS_DET_FLAG_1, &data_flag1, 1);
+    ret = paj7620_read_reg(PAJ7620_ADDR_GES_PS_DET_FLAG_1, &data_flag1, 1);
+    if (ret != ESP_OK) {
+        // I2C read failed - return no gesture rather than crash
+        return PAJ7620_GESTURE_NONE;
+    }
     _current_gesture = (paj7620_gesture_t)(((uint16_t)data_flag1) << 8);
 
     if (_current_gesture == PAJ7620_GESTURE_WAVE) {
@@ -389,7 +451,10 @@ paj7620_gesture_t paj7620_get_gesture(void) {
     } else {
         _current_gesture = PAJ7620_GESTURE_NONE;
         // Read FLAG_0 for other gestures
-        paj7620_read_reg(PAJ7620_ADDR_GES_PS_DET_FLAG_0, &data_flag0, 1);
+        ret = paj7620_read_reg(PAJ7620_ADDR_GES_PS_DET_FLAG_0, &data_flag0, 1);
+        if (ret != ESP_OK) {
+            return PAJ7620_GESTURE_NONE;
+        }
         _current_gesture = (paj7620_gesture_t)(((uint16_t)data_flag0) & 0x00FF);
 
         if (!_gesture_high_rate && _current_gesture != PAJ7620_GESTURE_NONE) {
@@ -465,22 +530,22 @@ static void on_paj_gesture(paj7620_gesture_t g)
 {
     if (g & PAJ7620_GESTURE_CLOCKWISE) {
         // PHOTO (VGA)
-        ESP_LOGI(TAG, "Taking photo (VGA)...");
+        ESP_LOGI(TAG, "📸 Taking photo (VGA)...");
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
             esp_err_t ret = media_save_photo(fb); // media_save_photo should handle VGA now
             esp_camera_fb_return(fb);
             (void)ret;
         } else {
-            ESP_LOGE(TAG, "Camera capture failed");
+            ESP_LOGE(TAG, "❌ Camera capture failed");
         }
         return;
     }
 
     if (g & PAJ7620_GESTURE_ANTICLOCKWISE) {
         // VIDEO (disabled for now, but kept for future)
-        esp_err_t res = media_capture_jpeg_burst(10000, 10, 120);
-        (void)res;
+        // esp_err_t res = media_capture_jpeg_burst(10000, 20, 200);
+        // (void)res;
     }
 
     // BLE HID CONTROLS (only when connected)
@@ -497,39 +562,36 @@ static void on_paj_gesture(paj7620_gesture_t g)
     else if (g & PAJ7620_GESTURE_RIGHT)   (void)ble_hid_cc_tap_next();
 }
 
+// Track consecutive I2C failures for recovery
+static uint8_t s_i2c_fail_count = 0;
+#define PAJ7620_MAX_I2C_FAILURES 10
+
 void paj7620_task(void *pvParameters) {
     paj7620_gesture_t gesture;
     paj7620_gesture_t last_gesture = PAJ7620_GESTURE_NONE;
-    bool was_idle = false;
 
     ESP_LOGI(TAG, "Gesture reading task started (high_rate=%d)", _gesture_high_rate);
 
     while (1) {
-        if (system_is_idle()) {
-            if (!was_idle) {
-                system_mark_task_paused(SYSTEM_TASK_GESTURE, true);
-                was_idle = true;
-            }
-            vTaskDelay(pdMS_TO_TICKS(200));
-            continue;
-        }
-        if (was_idle) {
-            system_mark_task_paused(SYSTEM_TASK_GESTURE, false);
-            was_idle = false;
-        }
-
         gesture = paj7620_get_gesture();
+
+        // Track failures for potential recovery
+        if (gesture == PAJ7620_GESTURE_NONE) {
+            // Could be real "no gesture" or I2C failure - we can't distinguish easily
+            // Reset failure count on any read (even if no gesture)
+            s_i2c_fail_count = 0;
+        }
 
         if (gesture != PAJ7620_GESTURE_NONE && gesture != last_gesture) {
             ESP_LOGI(TAG, "👋 Gesture: %s (0x%04X)", paj7620_gesture_name(gesture), gesture);
             on_paj_gesture(gesture);
             last_gesture = gesture;
+            s_i2c_fail_count = 0;  // Successful read
         } else if (gesture == PAJ7620_GESTURE_NONE) {
             last_gesture = PAJ7620_GESTURE_NONE;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(_gesture_high_rate ? 50 : 100));
+        // Faster polling for better responsiveness (30ms in high-rate mode)
+        vTaskDelay(pdMS_TO_TICKS(_gesture_high_rate ? 30 : 80));
     }
 }
-
-

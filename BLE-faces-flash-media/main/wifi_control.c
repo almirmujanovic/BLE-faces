@@ -19,17 +19,8 @@ esp_err_t wifi_control_start(void)
     esp_err_t err;
     ESP_LOGI(TAG, "Starting WiFi AP + HTTP server...");
 
-    err = esp_netif_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = esp_event_loop_create_default();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     esp_netif_create_default_wifi_ap();
 

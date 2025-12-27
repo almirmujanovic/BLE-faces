@@ -26,7 +26,6 @@ extern "C" {
 #endif
 
 esp_err_t init_face_detection(void);
-void face_detection_deinit(void);
 face_detection_result_t* detect_faces(camera_fb_t* fb);
 void free_detection_result(face_detection_result_t* result);
 void face_detection_task(void *pvParameter);

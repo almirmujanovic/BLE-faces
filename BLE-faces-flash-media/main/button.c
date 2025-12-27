@@ -1,6 +1,5 @@
 #include "include/button.h"
 #include "include/leds.h"
-#include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -67,11 +66,7 @@ esp_err_t button_start(button_cb_t click_cb, button_cb_t hold_cb,
     s_hold_min_ms  = (hold_min_ms == 0) ? 2000 : hold_min_ms;
 
     // ensure PCA9536 input is configured
-    esp_err_t err = leds_configure_button_input();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Button input unavailable: %s", esp_err_to_name(err));
-        return err;
-    }
+    leds_configure_button_input();
 
     s_running = true;
     // increased stack from 2048 to 4096 to avoid stack overflow

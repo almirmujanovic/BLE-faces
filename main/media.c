@@ -470,6 +470,11 @@ esp_err_t media_capture_jpeg_burst(uint32_t duration_ms,
         return ESP_FAIL;
     }
 
+    const int64_t blink_interval_us = 250 * 1000;
+    int64_t last_blink_us = esp_timer_get_time();
+    bool blink_on = true;
+    leds_set(true, true);
+
     media_set_camera_busy(true);
     camera_fb_t *first_fb = esp_camera_fb_get();
     if (!first_fb || !first_fb->buf || first_fb->len == 0) {
@@ -478,6 +483,7 @@ esp_err_t media_capture_jpeg_burst(uint32_t duration_ms,
         }
         fclose(f);
         media_set_camera_busy(false);
+        leds_set(false, false);
         ESP_LOGE(TAG, "Video capture failed: no frame buffer");
         return ESP_FAIL;
     }
@@ -492,6 +498,7 @@ esp_err_t media_capture_jpeg_burst(uint32_t duration_ms,
             esp_camera_fb_return(first_fb);
             fclose(f);
             media_set_camera_busy(false);
+            leds_set(false, false);
             return ESP_FAIL;
         }
     }
@@ -598,6 +605,7 @@ esp_err_t media_capture_jpeg_burst(uint32_t duration_ms,
         esp_camera_fb_return(first_fb);
         fclose(f);
         media_set_camera_busy(false);
+        leds_set(false, false);
         ESP_LOGE(TAG, "Failed to allocate AVI index");
         return ESP_FAIL;
     }
@@ -619,6 +627,11 @@ esp_err_t media_capture_jpeg_burst(uint32_t duration_ms,
 
     while (1) {
         const int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_blink_us) >= blink_interval_us) {
+            blink_on = !blink_on;
+            leds_set(blink_on, blink_on);
+            last_blink_us = now_us;
+        }
         const int64_t elapsed_ms = (now_us - start_us) / 1000;
         if (elapsed_ms >= (int64_t)duration_ms) {
             break;
@@ -731,6 +744,7 @@ esp_err_t media_capture_jpeg_burst(uint32_t duration_ms,
     if (index) {
         heap_caps_free(index);
     }
+    leds_set(false, false);
 
     ESP_LOGI(TAG, "Saved video: %s (%u frames, %u fps)", filename, (unsigned)avi_ctx.frames, (unsigned)actual_fps);
     return ESP_OK;

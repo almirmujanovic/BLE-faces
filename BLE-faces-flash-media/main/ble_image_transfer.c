@@ -109,6 +109,25 @@ static const struct ble_gatt_svc_def img_svc[] = {
     },
 };
 */
+// UUID for CCCD descriptor (must be static, not compound literal)
+static const ble_uuid16_t UUID_DSC_CCCD = BLE_UUID16_INIT(BLE_GATT_DSC_CLT_CFG_UUID16);
+
+static const struct ble_gatt_dsc_def img_info_descs[] = {
+    {
+        .uuid = &UUID_DSC_CCCD.u,  // Use static variable
+        .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+        .access_cb = img_info_access,
+    },
+    { 0 }
+};
+static const struct ble_gatt_dsc_def img_data_descs[] = {
+    {
+        .uuid = &UUID_DSC_CCCD.u,  // Reuse same static variable
+        .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+        .access_cb = img_data_access,
+    },
+    { 0 }
+};
 static const struct ble_gatt_chr_def img_chrs[] = {
     {
         .uuid = &img_rx_uuid.u,
@@ -120,12 +139,14 @@ static const struct ble_gatt_chr_def img_chrs[] = {
         .access_cb = img_info_access,
         .flags = BLE_GATT_CHR_F_NOTIFY,
         .val_handle = &h_tx_info,
+        .descriptors = img_info_descs,
     },
     {
         .uuid = &img_data_uuid.u,
         .access_cb = img_data_access,
         .flags = BLE_GATT_CHR_F_NOTIFY,
         .val_handle = &h_tx_data,
+        .descriptors = img_data_descs,
     },
     { 0 }
 };
@@ -155,20 +176,44 @@ static int img_rx_access(uint16_t conn_handle, uint16_t attr_handle,
 static int img_info_access(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    (void)conn_handle;
-    (void)attr_handle;
-    (void)ctxt;
-    (void)arg;
+    // Handle CCCD writes
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
+        if (OS_MBUF_PKTLEN(ctxt->om) == 2) {
+            uint16_t flags = ctxt->om->om_data[0] | (ctxt->om->om_data[1] << 8);
+            g_info_ntf = (flags & 0x0001) != 0;
+            ESP_LOGI(TAG, "INFO CCCD: %s", g_info_ntf ? "ENABLED" : "DISABLED");
+        }
+        return 0;
+    }
+    
+    // Handle CCCD reads
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC) {
+        uint16_t flags = g_info_ntf ? 0x0001 : 0x0000;
+        return os_mbuf_append(ctxt->om, &flags, sizeof(flags));
+    }
+    
     return BLE_ATT_ERR_UNLIKELY;
 }
 
 static int img_data_access(uint16_t conn_handle, uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    (void)conn_handle;
-    (void)attr_handle;
-    (void)ctxt;
-    (void)arg;
+    // Handle CCCD writes
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
+        if (OS_MBUF_PKTLEN(ctxt->om) == 2) {
+            uint16_t flags = ctxt->om->om_data[0] | (ctxt->om->om_data[1] << 8);
+            g_data_ntf = (flags & 0x0001) != 0;
+            ESP_LOGI(TAG, "DATA CCCD: %s", g_data_ntf ? "ENABLED" : "DISABLED");
+        }
+        return 0;
+    }
+    
+    // Handle CCCD reads
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC) {
+        uint16_t flags = g_data_ntf ? 0x0001 : 0x0000;
+        return os_mbuf_append(ctxt->om, &flags, sizeof(flags));
+    }
+    
     return BLE_ATT_ERR_UNLIKELY;
 }
 
@@ -254,8 +299,6 @@ static void pump_task(void *pvParameters)
 void ble_img_xfer_init(void)
 {
     ESP_LOGI(TAG, "Initializing image transfer service...");
-
-    sanity_check_tables(img_svc);
     
     // Create pump queue and task
     pump_queue = xQueueCreate(10, sizeof(pump_msg_t));

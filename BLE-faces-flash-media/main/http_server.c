@@ -1,8 +1,6 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
-#include "esp_heap_caps.h"
-#include "freertos/FreeRTOS.h"
 #include <dirent.h>
 #include <sys/stat.h>
 #include <string.h>
@@ -280,10 +278,6 @@ static esp_err_t download_handler(httpd_req_t *req)
     } else {
         httpd_resp_set_type(req, "application/octet-stream");
     }
-
-    char content_disp[320];
-    snprintf(content_disp, sizeof(content_disp), "attachment; filename=\"%s\"", filename);
-    httpd_resp_set_hdr(req, "Content-Disposition", content_disp);
     
     // Stream file
     char buf[1024];
@@ -311,36 +305,10 @@ httpd_handle_t start_http_server(void)
     config.stack_size = 8192;  // Increase from default 4096 to 8192
     config.task_priority = 5;  // Lower priority to avoid mutex conflicts
     config.core_id = 1;        // Pin to Core 1
-    config.lru_purge_enable = true;
     
     httpd_handle_t server = NULL;
-    esp_err_t err = httpd_start(&server, &config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start failed: %s (free=%u largest=%u)",
-                 esp_err_to_name(err),
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        if (err == ESP_ERR_NO_MEM || err == ESP_ERR_HTTPD_TASK) {
-            config.stack_size = 4096;
-            config.max_open_sockets = 4;
-            config.max_uri_handlers = 6;
-            config.core_id = tskNO_AFFINITY;
-            err = httpd_start(&server, &config);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "httpd_start retry failed: %s (free=%u largest=%u)",
-                         esp_err_to_name(err),
-                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-                return NULL;
-            }
-            ESP_LOGW(TAG, "HTTP server started with reduced resources (stack=%u)",
-                     (unsigned)config.stack_size);
-        } else {
-            return NULL;
-        }
-    }
-
-    if (server) {
+    
+    if (httpd_start(&server, &config) == ESP_OK) {
         // Index page
         httpd_uri_t index = {
             .uri = "/",
@@ -373,7 +341,7 @@ httpd_handle_t start_http_server(void)
         };
         httpd_register_uri_handler(server, &download);
         
-        ESP_LOGI(TAG, "HTTP server started on core %d with priority %d",
+        ESP_LOGI(TAG, "HTTP server started on core %d with priority %d", 
                  config.core_id, config.task_priority);
     }
     

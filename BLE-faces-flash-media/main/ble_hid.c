@@ -10,7 +10,6 @@
 #include "host/ble_uuid.h"
 #include "host/ble_gatt.h"
 #include "host/ble_store.h"
-#include "ble_gatts_utils.h"
 
 // NimBLE built-in services (required for iOS HID compatibility)
 #include "services/bas/ble_svc_bas.h"  // Battery Service
@@ -30,6 +29,7 @@ static const ble_uuid16_t UUID_HID_REPORT_MAP    = BLE_UUID16_INIT(0x2A4B);
 static const ble_uuid16_t UUID_HID_REPORT        = BLE_UUID16_INIT(0x2A4D); // Input
 static const ble_uuid16_t UUID_HID_PROTO_MODE    = BLE_UUID16_INIT(0x2A4E);
 
+static const ble_uuid16_t UUID_DSC_CCCD          = BLE_UUID16_INIT(0x2902);
 static const ble_uuid16_t UUID_DSC_REPORT_REF    = BLE_UUID16_INIT(0x2908);
 
 // ---------- HID constants ----------
@@ -113,7 +113,8 @@ static esp_err_t cc_tap_bit_immediate(uint8_t bit_index);
 // ---------- Descriptors / Characteristics ----------
 // NOTE: BLE_ATT_F_READ/WRITE are REQUIRED to enable access; _ENC variants add encryption requirement
 static const struct ble_gatt_dsc_def s_input_descs[] = {
-    { .uuid = &UUID_DSC_REPORT_REF.u, .att_flags = BLE_ATT_F_READ | BLE_ATT_F_READ_ENC, .access_cb = hid_access },
+    { .uuid = &UUID_DSC_CCCD.u,       .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE | BLE_ATT_F_READ_ENC | BLE_ATT_F_WRITE_ENC, .access_cb = hid_access },
+    { .uuid = &UUID_DSC_REPORT_REF.u, .att_flags = BLE_ATT_F_READ | BLE_ATT_F_READ_ENC,                   .access_cb = hid_access },
     { 0 }
 };
 
@@ -152,6 +153,20 @@ static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC || ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
         const ble_uuid_t *du = ctxt->dsc ? ctxt->dsc->uuid : NULL;
         if (!du) return BLE_ATT_ERR_UNLIKELY;
+
+        // CCCD
+        if (ble_uuid_cmp(du, &UUID_DSC_CCCD.u) == 0) {
+            if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
+                if (OS_MBUF_PKTLEN(ctxt->om) != 2) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+                uint16_t cccd = ctxt->om->om_data[0] | (ctxt->om->om_data[1] << 8);
+                s_input_notify_en = (cccd & 0x0001) != 0;
+                ESP_LOGI(TAG, "Input CCCD %s", s_input_notify_en ? "ENABLED" : "DISABLED");
+                return 0;
+            } else {
+                uint16_t cccd = s_input_notify_en ? 0x0001 : 0x0000;
+                return os_mbuf_append(ctxt->om, &cccd, sizeof(cccd)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+        }
 
         // Report Reference
         if (ble_uuid_cmp(du, &UUID_DSC_REPORT_REF.u) == 0) {
@@ -206,7 +221,6 @@ static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
 // ---------- Public: register all HID-related services ----------
 esp_err_t ble_hid_init(void)
 {
-    sanity_check_tables(s_hid_svcs);
     // 1) Initialize NimBLE's built-in Device Information Service (required by iOS for HID)
     ble_svc_dis_init();
     ESP_LOGI(TAG, "Device Information Service initialized");

@@ -1,11 +1,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_attr.h"
 #include "esp_log.h"
-#include "esp_err.h"
-#include "esp_system.h"
-#include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_bt.h"
 #include "store/config/ble_store_config.h"
@@ -31,20 +27,64 @@ extern void ble_store_config_init(void);
 
 static const char *TAG = "BLE_TASK";
 
-// If we reset while connected, clear bond data on next boot.
-#define BLE_CONN_MAGIC 0x434F4E4E
+// ========== CRASH RECOVERY: Auto-erase NVS after repeated BLE init failures ==========
+// RTC memory survives soft resets but not power cycles
+#define BLE_CRASH_THRESHOLD 3  // After 1 crash, wipe NVS (aggressive recovery)
 
-RTC_NOINIT_ATTR static uint32_t s_ble_conn_magic;
-RTC_NOINIT_ATTR static uint32_t s_ble_conn_active;
+RTC_NOINIT_ATTR static uint32_t s_ble_boot_magic;
+RTC_NOINIT_ATTR static uint32_t s_ble_crash_count;
+#define BLE_BOOT_MAGIC 0xBEEFCAFE
 
-// Persistent connection flag for power-cycle detection.
-#define BLE_STATE_NS  "ble_state"
-#define BLE_STATE_KEY "conn_active"
+static bool s_ble_init_success = false;
 
-static void ble_clear_bonds_on_reset(void);
-static bool ble_get_persisted_conn_active(bool *found);
-static void ble_set_persisted_conn_active(bool active);
-static bool ble_namespace_has_entries(const char *ns);
+// Call this early in BLE init to check if we should wipe NVS
+static void ble_crash_recovery_check(void)
+{
+    // Check if RTC memory is valid (power cycle resets it)
+    if (s_ble_boot_magic != BLE_BOOT_MAGIC) {
+        // Fresh power-on, initialize
+        s_ble_boot_magic = BLE_BOOT_MAGIC;
+        s_ble_crash_count = 0;
+        ESP_LOGI(TAG, "Fresh boot detected, crash counter reset");
+    }
+    
+    // Increment crash counter (we'll clear it if init succeeds)
+    s_ble_crash_count++;
+    ESP_LOGI(TAG, "BLE boot attempt #%lu", (unsigned long)s_ble_crash_count);
+    
+    // Check if we've crashed too many times
+    if (s_ble_crash_count >= BLE_CRASH_THRESHOLD) {
+        ESP_LOGW(TAG, "🔴 BLE crashed %lu times in a row! Erasing NVS to recover...", 
+                 (unsigned long)s_ble_crash_count);
+        
+        // Erase NVS to clear corrupted bonding data
+        esp_err_t err = nvs_flash_erase();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "✅ NVS erased successfully - device will appear as unpaired");
+        } else {
+            ESP_LOGE(TAG, "Failed to erase NVS: %s", esp_err_to_name(err));
+        }
+        
+        // Re-init NVS after erase
+        err = nvs_flash_init();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to reinit NVS: %s", esp_err_to_name(err));
+        }
+        
+        // Reset counter so we don't keep erasing
+        s_ble_crash_count = 0;
+    }
+}
+
+// Call this after BLE init succeeds (from on_sync callback)
+static void ble_crash_recovery_success(void)
+{
+    if (!s_ble_init_success) {
+        s_ble_init_success = true;
+        s_ble_crash_count = 0;  // Reset counter - we made it!
+        ESP_LOGI(TAG, "✅ BLE initialized successfully, crash counter reset");
+    }
+}
 
 static void start_advertising(void);
 static int gap_event_cb(struct ble_gap_event *ev, void *arg);
@@ -94,6 +134,43 @@ static int face_notify_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     return BLE_ATT_ERR_READ_NOT_PERMITTED;
 }
 
+// Client Characteristic Configuration Descriptor
+static int face_notify_desc_cb(uint16_t conn_handle, uint16_t attr_handle,
+                               struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_ACCESS_OP_READ_DSC) {
+        uint16_t notify_state = g_notify_enabled ? 0x0001 : 0x0000;
+        return os_mbuf_append(ctxt->om, &notify_state, sizeof(notify_state)) == 0
+               ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    } 
+    
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_DSC) {
+        uint8_t data[4] = {0};
+        int len = OS_MBUF_PKTLEN(ctxt->om);
+        if (len > 4) len = 4;
+        
+        os_mbuf_copydata(ctxt->om, 0, len, data);
+        
+        // Check for notification enable (0x0001) or disable (0x0000)
+        bool new_notify_state = false;
+        if (len >= 2) {
+            uint16_t cccd_value = data[0] | (data[1] << 8);
+            new_notify_state = (cccd_value & 0x0001) != 0;
+        } else if (len == 1) {
+            new_notify_state = (data[0] != 0);
+        }
+        
+        if (new_notify_state != g_notify_enabled) {
+            g_notify_enabled = new_notify_state;
+            ESP_LOGI(TAG, "Notifications %s by client", g_notify_enabled ? "enabled" : "disabled");
+        }
+        
+        return 0;
+    }
+    
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
 // wipe bonds
 
 
@@ -106,7 +183,21 @@ static const ble_uuid128_t FACE_NOTIFY_UUID =
     BLE_UUID128_INIT(0xf0,0xde,0xac,0xbe,0x00,0x00,0x40,0x00,0x80,0x00,0x00,0xaa,0x00,0x02,0xfa,0x10);
 
 // GATT characteristics
+// --- In your BLE server file (not function-local) ---
+// GATT characteristics
+// --- In your BLE server file (not function-local) ---
 // UUID for CCCD descriptor (must be static, not compound literal)
+static const ble_uuid16_t FACE_CCCD_UUID = BLE_UUID16_INIT(BLE_GATT_DSC_CLT_CFG_UUID16);
+
+static const struct ble_gatt_dsc_def face_notify_descs[] = {
+    {
+        .uuid = &FACE_CCCD_UUID.u,  // Use static variable
+        .access_cb = face_notify_desc_cb,
+        .att_flags = BLE_ATT_F_READ | BLE_ATT_F_WRITE,
+    },
+    { 0 }
+};
+
 static const struct ble_gatt_chr_def g_chrs[] = {
     {
         .uuid = &CHR_UUID.u,
@@ -119,6 +210,7 @@ static const struct ble_gatt_chr_def g_chrs[] = {
         .access_cb = face_notify_access_cb,
         .val_handle = &g_face_notify_handle,
         .flags = BLE_GATT_CHR_F_NOTIFY,
+        .descriptors = face_notify_descs,
     },
     { 0 }
 };
@@ -138,8 +230,13 @@ static const struct ble_gatt_svc_def g_svcs[] = {
 void ble_send_face_notification(uint32_t frame_id, uint8_t face_count, 
                                 uint16_t x, uint16_t y, uint16_t width, uint16_t height, float confidence)
 {
-    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE || !g_notify_enabled) {
+    if (g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         return; // No connection
+    }
+
+    // Auto-enable notifications to work around Android permission restrictions
+    if (!g_notify_enabled) {
+        g_notify_enabled = true;
     }
 
     face_notification_t notification = {
@@ -195,9 +292,6 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (ev->connect.status == 0) {
             g_conn_handle = ev->connect.conn_handle;
-            g_notify_enabled = false;
-            s_ble_conn_active = 1;
-            ble_set_persisted_conn_active(true);
             ESP_LOGI(TAG, "Connected, handle=%u", g_conn_handle);
             ESP_LOGI(TAG, "CONNECT status=%d handle=%u", ev->connect.status, ev->connect.conn_handle);
             // Set connection handles for both services
@@ -207,14 +301,8 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
 
             // Initiate security for iOS pairing
             ESP_LOGI(TAG, "Initiating security to force pairing...");
-            struct ble_gap_conn_desc desc;
-            int rc = ble_gap_conn_find(g_conn_handle, &desc);
-            if (rc == 0 && !desc.sec_state.encrypted) {
-                rc = ble_gap_security_initiate(g_conn_handle);
-                ESP_LOGI(TAG, "Security initiate rc=%d", rc);
-                if (rc != 0) {
-                    ESP_LOGW(TAG, "Security initiate failed");
-                }
+            if (ble_gap_security_initiate(g_conn_handle) != 0) {
+                ESP_LOGW(TAG, "Security initiate failed");
             }
         } else {
             ESP_LOGE(TAG, "Connection failed; status=%d", ev->connect.status);
@@ -226,10 +314,6 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
      case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "Disconnected; reason=%d", ev->disconnect.reason);
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        g_notify_enabled = false;
-        s_ble_conn_active = 0;
-        ble_set_persisted_conn_active(false);
-        ble_hid_set_conn(BLE_HS_CONN_HANDLE_NONE);
         ble_img_xfer_on_disconnect();
         ESP_LOGW(TAG, "DISCONNECT reason=%d", ev->disconnect.reason);
         start_advertising();
@@ -260,21 +344,11 @@ static int gap_event_cb(struct ble_gap_event *ev, void *arg)
 
     case BLE_GAP_EVENT_ENC_CHANGE:
         if (ev->enc_change.status == 0) {
-            ESP_LOGI(TAG, "Successfully paired and encrypted");
+            ESP_LOGI(TAG, "🔐 Successfully paired and encrypted!");
         } else {
             ESP_LOGW(TAG, "Encryption change failed: %d", ev->enc_change.status);
         }
         break;
-
-    case BLE_GAP_EVENT_REPEAT_PAIRING: {
-        struct ble_gap_conn_desc desc;
-        int rc = ble_gap_conn_find(ev->repeat_pairing.conn_handle, &desc);
-        if (rc == 0) {
-            ESP_LOGW(TAG, "Repeat pairing; deleting old bond");
-            ble_store_util_delete_peer(&desc.peer_id_addr);
-        }
-        return BLE_GAP_REPEAT_PAIRING_RETRY;
-    }
 
     case BLE_GAP_EVENT_NOTIFY_TX:  // resume pumping image chunks when TX frees
         ble_img_xfer_on_notify_tx();                               
@@ -305,9 +379,9 @@ static void start_advertising(void)
     // adv.tx_pwr_lvl_is_present = 1;
     // adv.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
 
-    // HID appearance (Keyboard or Generic HID both OK)
+    // HID appearance - use Keyboard (0x03C1) for better iOS compatibility
     adv.appearance_is_present = 1;
-    adv.appearance = 0x03C1; // HID Keyboard (better iOS compatibility)
+    adv.appearance = 0x03C1; // HID Keyboard (better for iOS media controls)
 
     // Include BOTH service UUID lists in primary ADV (best for iOS filtering)
     adv.uuids16 = (ble_uuid16_t *)&s_uuid16_hid;
@@ -347,7 +421,7 @@ static void start_advertising(void)
     memset(&rsp, 0, sizeof(rsp));
 
     // Put device name in scan response (safer vs truncation).
-    const char *full_name = "ESP";
+    const char *full_name = "ESP-CHAKRA";
     rsp.name = (uint8_t *)full_name;
     rsp.name_len = strlen(full_name);
     rsp.name_is_complete = 1;
@@ -422,6 +496,9 @@ static void on_sync(void)
     int rc = ble_gatts_start();
     if (rc != 0) { ESP_LOGE(TAG, "ble_gatts_start rc=%d", rc); return; }
     ESP_LOGI(TAG, "All GATT services started");
+    
+    // BLE init succeeded! Clear the crash counter
+    ble_crash_recovery_success();
 
     ble_img_xfer_resolve_handles();
     ESP_ERROR_CHECK(ble_hid_get_handles());
@@ -435,7 +512,7 @@ static void on_sync(void)
         g_own_addr_type = BLE_OWN_ADDR_RANDOM; // last-ditch
     }
 
-    // Log the actual address we'll use
+    // Log the actual address we’ll use
     uint8_t addr_val[6];
     rc = ble_hs_id_copy_addr(g_own_addr_type, addr_val, NULL);
     if (rc == 0) {
@@ -450,135 +527,23 @@ static void on_sync(void)
     start_advertising();
 }
 
-static void ble_clear_bonds_on_reset(void)
-{
-    static const char *NS_BOND = "nimble_bond";
-    static const char *NS_SVC  = "nimble_svc";
-    bool rtc_conn_active = false;
-    bool nvs_conn_active = false;
-    bool state_found = false;
-
-    if (s_ble_conn_magic == BLE_CONN_MAGIC) {
-        rtc_conn_active = (s_ble_conn_active != 0);
-    } else {
-        s_ble_conn_magic = BLE_CONN_MAGIC;
-        s_ble_conn_active = 0;
-    }
-
-    nvs_conn_active = ble_get_persisted_conn_active(&state_found);
-    if (!state_found) {
-        if (ble_namespace_has_entries(NS_BOND) || ble_namespace_has_entries(NS_SVC)) {
-            ESP_LOGW(TAG, "BLE state flag missing with existing NVS data; clearing for safety");
-            nvs_conn_active = true;
-        }
-    }
-
-    if (!rtc_conn_active && !nvs_conn_active) {
-        return;
-    }
-
-    esp_reset_reason_t reason = esp_reset_reason();
-
-    nvs_handle_t handle;
-    esp_err_t err_bond = nvs_open(NS_BOND, NVS_READWRITE, &handle);
-    if (err_bond == ESP_OK) {
-        err_bond = nvs_erase_all(handle);
-        if (err_bond == ESP_OK) {
-            err_bond = nvs_commit(handle);
-        }
-        nvs_close(handle);
-    }
-
-    esp_err_t err_svc = nvs_open(NS_SVC, NVS_READWRITE, &handle);
-    if (err_svc == ESP_OK) {
-        err_svc = nvs_erase_all(handle);
-        if (err_svc == ESP_OK) {
-            err_svc = nvs_commit(handle);
-        }
-        nvs_close(handle);
-    }
-
-    if (err_bond == ESP_OK && err_svc == ESP_OK) {
-        ESP_LOGW(TAG, "Cleared BLE bond/service store after reset (reason=%d)", reason);
-    } else {
-        if (err_bond != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to clear %s: %s", NS_BOND, esp_err_to_name(err_bond));
-        }
-        if (err_svc != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to clear %s: %s", NS_SVC, esp_err_to_name(err_svc));
-        }
-    }
-
-    s_ble_conn_active = 0;
-    ble_set_persisted_conn_active(false);
-}
-
-static bool ble_get_persisted_conn_active(bool *found)
-{
-    nvs_handle_t handle;
-    uint8_t val = 0;
-    if (found) {
-        *found = false;
-    }
-    esp_err_t err = nvs_open(BLE_STATE_NS, NVS_READONLY, &handle);
-    if (err == ESP_OK) {
-        err = nvs_get_u8(handle, BLE_STATE_KEY, &val);
-        if (err == ESP_OK && found) {
-            *found = true;
-        }
-        nvs_close(handle);
-    }
-    return val != 0;
-}
-
-static void ble_set_persisted_conn_active(bool active)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(BLE_STATE_NS, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open %s: %s", BLE_STATE_NS, esp_err_to_name(err));
-        return;
-    }
-
-    err = nvs_set_u8(handle, BLE_STATE_KEY, active ? 1 : 0);
-    if (err == ESP_OK) {
-        err = nvs_commit(handle);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to persist conn_active=%d: %s", active ? 1 : 0, esp_err_to_name(err));
-    }
-    nvs_close(handle);
-}
-
-static bool ble_namespace_has_entries(const char *ns)
-{
-    nvs_iterator_t it = NULL;
-    esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, ns, NVS_TYPE_ANY, &it);
-    if (err == ESP_OK && it != NULL) {
-        nvs_release_iterator(it);
-        return true;
-    }
-    if (it != NULL) {
-        nvs_release_iterator(it);
-    }
-    return false;
-}
-
 
 // Good ble_start_all(): register everything, set callbacks. Do NOT start or resolve yet.
 static void ble_start_all(const char *device_name)
 {
+    // Check for repeated crashes and auto-erase NVS if needed
+    ble_crash_recovery_check();
+    
     ESP_ERROR_CHECK(nvs_flash_init());
-    ble_clear_bonds_on_reset();
     esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
 
     nimble_port_init();
     ble_store_config_init();
 
-    // Require bonding; Just Works (no IO)
+        // Require bonding; Just Works (no IO); enable LE Secure Connections
     ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm    = 0;   // set 1 if you add passkey/pin UX later
-    ble_hs_cfg.sm_sc      = 0;   // disable LE SC to avoid DHKey check failures
+    ble_hs_cfg.sm_sc      = 1;
     ble_hs_cfg.sm_io_cap  = BLE_HS_IO_NO_INPUT_OUTPUT;
 
     // Distribute encryption and identity keys so iOS will remember you
@@ -586,7 +551,7 @@ static void ble_start_all(const char *device_name)
     ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
     // Configure NimBLE host callbacks BEFORE the host starts
-    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_hs_cfg.store_status_cb = NULL;
     ble_hs_cfg.reset_cb        = on_reset;
     ble_hs_cfg.sync_cb         = on_sync;
 
@@ -600,21 +565,20 @@ static void ble_start_all(const char *device_name)
 
     // 1) Register HID (count + add only)
     ESP_ERROR_CHECK(ble_hid_init());
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(50));  // Allow flash cache to stabilize
 
     // 2) Register your FACE service (count + add only)
-    sanity_check_tables(g_svcs);
     int rc = ble_gatts_count_cfg(g_svcs);
     assert(rc == 0);
     rc = ble_gatts_add_svcs(g_svcs);
     assert(rc == 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(50));  // Allow flash cache to stabilize
 
     // (optional) sanity_check_tables(...) + dump_table(...)
 
     // 3) Register IMAGE XFER (count + add only; do not resolve yet)
     ble_img_xfer_init();
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(100)); // Allow flash cache to stabilize before host task
 
     // Do NOT call ble_gatts_start() here.
     // Do NOT resolve handles here.

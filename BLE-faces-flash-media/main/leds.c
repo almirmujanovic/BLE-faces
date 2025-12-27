@@ -89,26 +89,6 @@ bool leds_button_is_pressed(void)
 
 
 // ---------------------------------------------------
-// Internal: set all 4 outputs at once
-// ---------------------------------------------------
-static esp_err_t pca9536_set_all(uint8_t eio0, uint8_t led1,
-                                 uint8_t led2, uint8_t eio3)
-{
-    // Ensure only LSB used for each value and map to correct EIO bits
-    s_output_state =
-        ((eio0  & 0x01) << EIO0_BIT) |
-        ((led1  & 0x01) << EIO1_BIT) |
-        ((led2  & 0x01) << EIO2_BIT) |
-        ((eio3  & 0x01) << EIO3_BIT);
-
-    esp_err_t err = pca9536_write_reg(PCA9536_REG_OUT, s_output_state);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set PCA9536 outputs: %s", esp_err_to_name(err));
-    }
-    return err;
-}
-
-// ---------------------------------------------------
 // Public: initialize PCA9536 on shared I2C bus
 // ---------------------------------------------------
 // Initialize PCA9536 and set initial outputs
@@ -143,16 +123,6 @@ esp_err_t leds_init(void)
         return err;
     }
 
-    // Probe the device to make sure it responds on the bus.
-    uint8_t cfg = 0;
-    err = pca9536_read_reg(PCA9536_REG_CFG, &cfg);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "PCA9536 not responding, disabling LED support: %s", esp_err_to_name(err));
-        i2c_master_bus_rm_device(s_pca_dev);
-        s_pca_dev = NULL;
-        return err;
-    }
-
     // Configure pins: set EIO0/EIO2/EIO3 as outputs; EIO1 will be reconfigured when leds_configure_button_input() is called
     err = pca9536_write_reg(PCA9536_REG_CFG, 0x00); // all outputs for now
     if (err != ESP_OK) {
@@ -161,6 +131,7 @@ esp_err_t leds_init(void)
     }
 
     // Initial state: LEDs are active-low, so HIGH = OFF
+    // Set EIO0 and EIO3 high to keep both LEDs off initially
     s_output_state = (1 << EIO0_BIT) | (1 << EIO3_BIT);
     err = pca9536_write_output_state(s_output_state);
     if (err != ESP_OK) {
@@ -171,7 +142,7 @@ esp_err_t leds_init(void)
     return ESP_OK;
 }
 // ---------------------------------------------------
-// Public: set LEDs (idle/capture)
+// Public: set LEDs (IO1/IO2)
 // ---------------------------------------------------
 void leds_set(bool idle_led, bool capture_led)
 {
