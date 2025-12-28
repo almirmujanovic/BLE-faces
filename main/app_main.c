@@ -481,6 +481,13 @@ void app_main(void)
     spi_flash_mmap_dump();
     vTaskDelay(pdMS_TO_TICKS(200));
 
+    ESP_LOGI(TAG, "Initializing shared I2C bus...");
+    ret = power_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Power/I2C init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
 
     ESP_LOGI(TAG, "Initializing camera...");
     ret = init_camera();
@@ -569,11 +576,9 @@ void app_main(void)
         return;
     }
     log_memory_usage("AFTER_IMG_TASK");
-    // Init I2C bus for power/LEDs
-    if (power_init() == ESP_OK) {
-        uint8_t id;
-        power_bq25155_read_id(&id);  // will just warn if not present
-    }
+    // Read BQ25155 device ID (if present) on the shared bus.
+    uint8_t id;
+    power_bq25155_read_id(&id);  // will just warn if not present
 
     // Initialize LEDs on PCA9536
     if (leds_init() == ESP_OK) {

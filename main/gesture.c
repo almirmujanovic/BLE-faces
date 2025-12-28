@@ -19,6 +19,12 @@ static i2c_master_dev_handle_t paj7620_dev_handle = NULL;
 static bool _gesture_high_rate = true;
 static paj7620_gesture_t _current_gesture = PAJ7620_GESTURE_NONE;
 
+#define PAJ7620_I2C_TIMEOUT_MS      200
+#define PAJ7620_INIT_ATTEMPTS       3
+#define PAJ7620_INIT_RETRY_DELAY_MS 50
+#define PAJ7620_REG_RETRIES         2
+#define PAJ7620_REG_RETRY_DELAY_MS  2
+
 // PAJ7620 initialization array (from DFRobot library)
 static const uint8_t init_register_array[][2] = {
     {0xEF,0x00},
@@ -246,18 +252,50 @@ static const uint8_t init_register_array[][2] = {
 static esp_err_t paj7620_write_reg(uint8_t reg, uint8_t data) {
     if (!paj7620_dev_handle) return ESP_ERR_INVALID_STATE;
     uint8_t write_buf[2] = {reg, data};
-    return i2c_master_transmit(paj7620_dev_handle, write_buf, 2, -1);
+    return i2c_master_transmit(paj7620_dev_handle, write_buf, 2, PAJ7620_I2C_TIMEOUT_MS);
 }
 
 // Read bytes from PAJ7620 register
 static esp_err_t paj7620_read_reg(uint8_t reg, uint8_t *data, size_t len) {
     if (!paj7620_dev_handle) return ESP_ERR_INVALID_STATE;
-    return i2c_master_transmit_receive(paj7620_dev_handle, &reg, 1, data, len, -1);
+    return i2c_master_transmit_receive(paj7620_dev_handle, &reg, 1, data, len, PAJ7620_I2C_TIMEOUT_MS);
+}
+
+static esp_err_t paj7620_write_reg_retry(uint8_t reg, uint8_t data, int retries) {
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 0; attempt <= retries; ++attempt) {
+        ret = paj7620_write_reg(reg, data);
+        if (ret == ESP_OK) {
+            return ESP_OK;
+        }
+        if (attempt < retries) {
+            vTaskDelay(pdMS_TO_TICKS(PAJ7620_REG_RETRY_DELAY_MS));
+        }
+    }
+    return ret;
+}
+
+static esp_err_t paj7620_read_reg_retry(uint8_t reg, uint8_t *data, size_t len, int retries) {
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 0; attempt <= retries; ++attempt) {
+        ret = paj7620_read_reg(reg, data, len);
+        if (ret == ESP_OK) {
+            return ESP_OK;
+        }
+        if (attempt < retries) {
+            vTaskDelay(pdMS_TO_TICKS(PAJ7620_REG_RETRY_DELAY_MS));
+        }
+    }
+    return ret;
 }
 
 // Select register bank
 static esp_err_t paj7620_select_bank(paj7620_bank_t bank) {
     return paj7620_write_reg(PAJ7620_REGITER_BANK_SEL, (uint8_t)bank);
+}
+
+static esp_err_t paj7620_select_bank_retry(paj7620_bank_t bank, int retries) {
+    return paj7620_write_reg_retry(PAJ7620_REGITER_BANK_SEL, (uint8_t)bank, retries);
 }
 
 // ------------------------------------------------------
@@ -306,54 +344,71 @@ esp_err_t paj7620_init(void) {
     esp_err_t ret;
     uint8_t part_id[2];
 
+    if (!paj7620_dev_handle) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // Wait for sensor to wake up
     vTaskDelay(pdMS_TO_TICKS(800));
 
-    // Select Bank 0
-    ret = paj7620_select_bank(PAJ7620_BANK0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to select bank 0");
-        return ret;
-    }
-
-    // Read Part ID (2 bytes)
-    ret = paj7620_read_reg(PAJ7620_ADDR_PART_ID_LOW, part_id, 2);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to read Part ID");
-        return ret;
-    }
-
-    uint16_t pid = part_id[0] | (part_id[1] << 8);
-    ESP_LOGI(TAG, "Part ID: 0x%04X", pid);
-
-    if (pid != PAJ7620_PARTID) {
-        ESP_LOGE(TAG, "Invalid Part ID! Expected 0x%04X, got 0x%04X",
-                 PAJ7620_PARTID, pid);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    // Write initialization array
-    size_t init_array_size = sizeof(init_register_array) / sizeof(init_register_array[0]);
-    ESP_LOGI(TAG, "Writing %d initialization registers...", (int)init_array_size);
-
-    for (size_t i = 0; i < init_array_size; i++) {
-        ret = paj7620_write_reg(init_register_array[i][0], init_register_array[i][1]);
+    for (int attempt = 0; attempt < PAJ7620_INIT_ATTEMPTS; ++attempt) {
+        // Select Bank 0
+        ret = paj7620_select_bank_retry(PAJ7620_BANK0, PAJ7620_REG_RETRIES);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to write init register %d (reg=0x%02X)", (int)i,
-                     init_register_array[i][0]);
-            return ret;
+            ESP_LOGE(TAG, "Failed to select bank 0");
+            goto retry;
+        }
+
+        // Read Part ID (2 bytes)
+        ret = paj7620_read_reg_retry(PAJ7620_ADDR_PART_ID_LOW, part_id, 2, PAJ7620_REG_RETRIES);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read Part ID");
+            goto retry;
+        }
+
+        uint16_t pid = part_id[0] | (part_id[1] << 8);
+        ESP_LOGI(TAG, "Part ID: 0x%04X", pid);
+
+        if (pid != PAJ7620_PARTID) {
+            ESP_LOGE(TAG, "Invalid Part ID! Expected 0x%04X, got 0x%04X",
+                     PAJ7620_PARTID, pid);
+            ret = ESP_ERR_NOT_FOUND;
+            goto retry;
+        }
+
+        // Write initialization array
+        size_t init_array_size = sizeof(init_register_array) / sizeof(init_register_array[0]);
+        ESP_LOGI(TAG, "Writing %d initialization registers...", (int)init_array_size);
+
+        for (size_t i = 0; i < init_array_size; i++) {
+            ret = paj7620_write_reg_retry(init_register_array[i][0], init_register_array[i][1],
+                                          PAJ7620_REG_RETRIES);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to write init register %d (reg=0x%02X)", (int)i,
+                         init_register_array[i][0]);
+                goto retry;
+            }
+        }
+
+        // Select Bank 0 for gesture reading
+        ret = paj7620_select_bank_retry(PAJ7620_BANK0, PAJ7620_REG_RETRIES);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to select bank 0");
+            goto retry;
+        }
+
+        ESP_LOGI(TAG, "PAJ7620 initialized successfully");
+        return ESP_OK;
+
+retry:
+        ESP_LOGW(TAG, "PAJ7620 init attempt %d/%d failed: %s",
+                 attempt + 1, PAJ7620_INIT_ATTEMPTS, esp_err_to_name(ret));
+        if (attempt + 1 < PAJ7620_INIT_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(PAJ7620_INIT_RETRY_DELAY_MS));
         }
     }
 
-    // Select Bank 0 for gesture reading
-    ret = paj7620_select_bank(PAJ7620_BANK0);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to select bank 0");
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "PAJ7620 initialized successfully");
-    return ESP_OK;
+    return ret;
 }
 
 esp_err_t paj7620_deinit(void)

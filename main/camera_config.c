@@ -1,4 +1,5 @@
 #include "camera_config.h"
+#include "power.h"
 #include "esp_log.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
@@ -46,8 +47,9 @@ esp_err_t init_camera(void)
         .pin_pwdn      = CAM_PWDN_GPIO,
         .pin_reset     = CAM_RESET_GPIO,
         .pin_xclk      = CAM_XCLK_GPIO,
-        .pin_sscb_sda  = CAM_SIOD_GPIO,
-        .pin_sscb_scl  = CAM_SIOC_GPIO,
+        // Use the shared I2C bus initialized in power.c
+        .pin_sccb_sda  = -1,
+        .pin_sccb_scl  = -1,
 
         .pin_d7        = CAM_D7_GPIO,
         .pin_d6        = CAM_D6_GPIO,
@@ -72,6 +74,7 @@ esp_err_t init_camera(void)
         .fb_count      = 2,
         .fb_location   = CAMERA_FB_IN_PSRAM,
         .grab_mode     = CAMERA_GRAB_LATEST,
+        .sccb_i2c_port = POWER_I2C_PORT,
     };
     // --------------------------------------------------------------------
 

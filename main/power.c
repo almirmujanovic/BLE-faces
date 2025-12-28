@@ -7,11 +7,7 @@
 
 static const char *TAG = "POWER";
 
-// ------- I2C pins / params (adjust if needed) -------
-#define POWER_I2C_PORT      I2C_NUM_0
-#define POWER_I2C_SDA       2
-#define POWER_I2C_SCL       3
-#define POWER_I2C_FREQ_HZ   100000 // 100 kHz is fine
+// ------- I2C pins / params (adjust in power.h if needed) -------
 
 // ------- BQ25155 definitions (from your demo) -------
 #define BQ25155_ADDR            0x6B
