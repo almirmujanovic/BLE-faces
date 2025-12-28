@@ -592,9 +592,9 @@ void app_main(void)
             xTaskCreatePinnedToCore(paj7620_task, "paj7620_task", 
                                    4096, NULL, 2, &g_paj_task_handle, 1);
             ESP_LOGI(TAG, "Gesture sensor initialized");
-            ESP_LOGI(TAG, "   CLOCKWISE gesture   = Take photo");
-            ESP_LOGI(TAG, "   ANTICLOCKWISE gesture = Record 10s video");
-            ESP_LOGI(TAG, "   UP/DOWN/LEFT/RIGHT = BLE HID (when connected)");
+            ESP_LOGI(TAG, "   PAJ gestures = BLE HID (when connected)");
+            ESP_LOGI(TAG, "   Hand ML 'five' = Take photo");
+            ESP_LOGI(TAG, "   Hand ML 'four' = Record 10s video");
         } else {
             ESP_LOGW(TAG, "Gesture sensor init failed");
         }
@@ -605,7 +605,7 @@ void app_main(void)
     
     log_memory_usage("APP_COMPLETE");
     ESP_LOGI(TAG, "=== Application started successfully ===");
-    ESP_LOGI(TAG, "Photo: CLOCKWISE gesture");
-    ESP_LOGI(TAG, "Video: ANTICLOCKWISE gesture");
+    ESP_LOGI(TAG, "Photo: Hand ML 'five'");
+    ESP_LOGI(TAG, "Video: Hand ML 'four'");
     ESP_LOGI(TAG, "Ready!");
 }

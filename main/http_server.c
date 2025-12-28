@@ -123,8 +123,8 @@ static esp_err_t index_handler(httpd_req_t *req)
              "</div>"
              "<p style='color: #666; margin-top: 30px;'>"
              "<strong>Gesture Controls:</strong><br>"
-             "• <strong>Forward</strong> - Take Photo<br>"
-             "• <strong>Backward</strong> - Start/Stop Video Recording"
+             "• <strong>Hand gesture: five fingers</strong> - Take Photo<br>"
+             "• <strong>Hand gesture: four fingers</strong> - Start 10s Video Recording"
              "</p>",
              photo_count, video_count);
     
@@ -138,60 +138,89 @@ static esp_err_t index_handler(httpd_req_t *req)
 // Images gallery
 static esp_err_t images_handler(httpd_req_t *req)
 {
+    bool show_thumbs = false;
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len > 0 && query_len < 64) {
+        char query[64];
+        char val[8] = {0};
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+            httpd_query_key_value(query, "thumbs", val, sizeof(val)) == ESP_OK) {
+            show_thumbs = (strcmp(val, "1") == 0);
+        }
+    }
+
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr_chunk(req, html_header);
-    
-    httpd_resp_sendstr_chunk(req, "<h1>📸 Photos</h1>");
-    httpd_resp_sendstr_chunk(req, "<div class='nav-links'><a href='/'>← Back to Home</a></div>");
+
+    httpd_resp_sendstr_chunk(req, "<h1>Photos</h1>");
+    httpd_resp_sendstr_chunk(req, "<div class='nav-links'>");
+    httpd_resp_sendstr_chunk(req, "<a href='/'>Back to Home</a>");
+    if (show_thumbs) {
+        httpd_resp_sendstr_chunk(req, "<a href='/images'>Hide thumbnails</a>");
+    } else {
+        httpd_resp_sendstr_chunk(req, "<a href='/images?thumbs=1'>Show thumbnails</a>");
+    }
+    httpd_resp_sendstr_chunk(req, "</div>");
     httpd_resp_sendstr_chunk(req, "<div class='media-grid'>");
-    
+
     DIR *dir = opendir(MEDIA_MOUNT_POINT);
     int count = 0;
-    
+
     if (dir) {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_type == DT_REG && 
+            if (entry->d_type == DT_REG &&
                 (strstr(entry->d_name, ".jpg") || strstr(entry->d_name, ".jpeg"))) {
-                
+
                 char filepath[MEDIA_PATH_MAX];
                 snprintf(filepath, sizeof(filepath), MEDIA_MOUNT_POINT "/%.*s",
                          MEDIA_NAME_MAX, entry->d_name);
-                
+
                 struct stat st;
                 char size_str[32] = "Unknown";
                 if (stat(filepath, &st) == 0) {
                     format_size(st.st_size, size_str, sizeof(size_str));
                 }
-                
+
                 char item_html[ITEM_HTML_MAX];
-                snprintf(item_html, sizeof(item_html),
-                         "<div class='media-item'>"
-                         "<img src='/download?file=%.*s' alt='%.*s' loading='lazy'>"
-                         "<a href='/download?file=%.*s'>%.*s</a>"
-                         "<div class='size'>%.31s</div>"
-                         "</div>",
-                         HTML_NAME_MAX, entry->d_name,
-                         HTML_NAME_MAX, entry->d_name,
-                         HTML_NAME_MAX, entry->d_name,
-                         HTML_NAME_MAX, entry->d_name,
-                         size_str);
-                
+                if (show_thumbs) {
+                    snprintf(item_html, sizeof(item_html),
+                             "<div class='media-item'>"
+                             "<img src='/download?file=%.*s' alt='%.*s' loading='lazy'>"
+                             "<a href='/download?file=%.*s'>%.*s</a>"
+                             "<div class='size'>%.31s</div>"
+                             "</div>",
+                             HTML_NAME_MAX, entry->d_name,
+                             HTML_NAME_MAX, entry->d_name,
+                             HTML_NAME_MAX, entry->d_name,
+                             HTML_NAME_MAX, entry->d_name,
+                             size_str);
+                } else {
+                    snprintf(item_html, sizeof(item_html),
+                             "<div class='media-item'>"
+                             "<a href='/download?file=%.*s'>%.*s</a>"
+                             "<div class='size'>%.31s</div>"
+                             "</div>",
+                             HTML_NAME_MAX, entry->d_name,
+                             HTML_NAME_MAX, entry->d_name,
+                             size_str);
+                }
+
                 httpd_resp_sendstr_chunk(req, item_html);
                 count++;
             }
         }
         closedir(dir);
     }
-    
+
     if (count == 0) {
-        httpd_resp_sendstr_chunk(req, "<div class='empty'>No photos found. Use FORWARD gesture to take a photo!</div>");
+        httpd_resp_sendstr_chunk(req, "<div class='empty'>No photos found. Use hand gesture 'five' to take a photo!</div>");
     }
-    
+
     httpd_resp_sendstr_chunk(req, "</div>");
     httpd_resp_sendstr_chunk(req, html_footer);
     httpd_resp_sendstr_chunk(req, NULL);
-    
+
     return ESP_OK;
 }
 
@@ -244,7 +273,7 @@ static esp_err_t videos_handler(httpd_req_t *req)
     }
     
     if (count == 0) {
-        httpd_resp_sendstr_chunk(req, "<div class='empty'>No videos found. Use BACKWARD gesture to record a video!</div>");
+        httpd_resp_sendstr_chunk(req, "<div class='empty'>No videos found. Use hand gesture 'four' to record a video!</div>");
     }
     
     httpd_resp_sendstr_chunk(req, "</div>");
