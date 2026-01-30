@@ -1,0 +1,14 @@
+# Name,               Type, SubType, Offset,    Size
+nvs,                  data, nvs,     0x9000,    0x6000
+phy_init,             data, phy,     0xf000,    0x1000
+
+factory,              app,  factory, 0x10000,   0x500000
+
+human_face_det,       data, fat,     0x510000,  0x200000
+hand_det,             data, fat,     0x710000,  0x200000
+hand_gesture_cls,     data, fat,     0x910000,  0x200000
+
+media,                data, spiffs,  0xB10000,  0x14F0000
+
+
+
