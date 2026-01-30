@@ -21,6 +21,7 @@ void      ble_hid_check_cccd_subscribe(uint16_t attr_handle, uint16_t cur_notify
 
 // Optional: let callers know when it's safe to send (connected + CCCD enabled).
 bool      ble_hid_is_ready(void);
+bool      ble_hid_tel_is_ready(void);
 
 // Bitmap sender (lower 7 bits valid per the report map). Enqueues safely.
 esp_err_t ble_hid_tap_consumer_bits(uint16_t bits);
@@ -33,6 +34,8 @@ esp_err_t ble_hid_cc_tap_play_pause(void);
 esp_err_t ble_hid_cc_tap_next(void);
 esp_err_t ble_hid_cc_tap_prev(void);
 esp_err_t ble_hid_cc_tap_stop(void);
+// Telephony (iOS call control) helper
+esp_err_t ble_hid_tel_tap_hook_switch(void);
 
 #ifdef __cplusplus
 }

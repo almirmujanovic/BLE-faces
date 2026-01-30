@@ -36,7 +36,7 @@ static const ble_uuid16_t UUID_DSC_REPORT_REF    = BLE_UUID16_INIT(0x2908);
 #define REPORT_ID_CC      0x03
 #define REPORT_TYPE_INPUT 0x01
 
-// Report map: Consumer Control with 7 buttons (1 byte payload) + 1 pad bit.
+// Report map: Consumer Control + Telephony (Hook Switch).
 static const uint8_t s_report_map[] = {
     0x05, 0x0C,              // Usage Page (Consumer)
     0x09, 0x01,              // Usage (Consumer Control)
@@ -57,6 +57,19 @@ static const uint8_t s_report_map[] = {
     0x95, 0x01, 0x75, 0x01,  //   1 pad bit
     0x81, 0x03,              //   Input (Const,Var,Abs)
     0xC0                     // End Collection
+  , 0x05, 0x0B,              // Usage Page (Telephony)
+    0x09, 0x05,              // Usage (Headset)
+    0xA1, 0x01,              // Collection (Application)
+    0x85, 0x04,              //   Report ID (4)
+    0x15, 0x00,              //   Logical Minimum (0)
+    0x25, 0x01,              //   Logical Maximum (1)
+    0x75, 0x01,              //   Report Size (1)
+    0x95, 0x01,              //   Report Count (1)
+    0x09, 0x20,              //   Usage (Hook Switch)
+    0x81, 0x02,              //   Input (Data,Var,Abs)
+    0x95, 0x07, 0x75, 0x01,  //   7 pad bits
+    0x81, 0x03,              //   Input (Const,Var,Abs)
+    0xC0                     // End Collection
 };
 
 // HID Information: ver 1.11, country=0, flags: normally connectable
@@ -65,17 +78,21 @@ static const uint8_t s_hid_info[4] = { 0x11, 0x01, 0x00, 0x03 };
 static uint8_t       s_proto_mode  = 0x01; // Report protocol only
 
 // Report Reference (Report ID=3, Type=Input)
-static const uint8_t s_report_ref[2] = { REPORT_ID_CC, REPORT_TYPE_INPUT };
+static const uint8_t s_report_ref_cc[2]  = { REPORT_ID_CC, REPORT_TYPE_INPUT };
+static const uint8_t s_report_ref_tel[2] = { 0x04,        REPORT_TYPE_INPUT };
 
 // ---------- State ----------
-static uint16_t s_conn             = BLE_HS_CONN_HANDLE_NONE;
-static uint16_t s_input_val_handle = 0;
-static bool     s_input_notify_en  = false;
+static uint16_t s_conn                = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t s_input_val_handle_cc = 0;
+static uint16_t s_input_val_handle_tel = 0;
+static bool     s_input_notify_en_cc  = false;
+static bool     s_input_notify_en_tel = false;
 
 // ---------- Worker/Queue to serialize HID sends ----------
 typedef enum {
-    HID_ACT_BITS,     // send 1-byte bitmap (lower 7 bits used)
-    HID_ACT_BITIDX    // send one specific bit by index (0..6)
+    HID_ACT_BITS,        // send 1-byte bitmap (lower 7 bits used) - CC
+    HID_ACT_BITIDX,      // send one specific bit by index (0..6) - CC
+    HID_ACT_TEL_BITIDX   // send one specific bit by index (0) - Telephony
 } hid_act_type_t;
 
 typedef struct {
@@ -88,7 +105,11 @@ static QueueHandle_t s_hid_q = NULL;
 static void          hid_worker(void *arg);
 
 bool ble_hid_is_ready(void) {
-    return (s_conn != BLE_HS_CONN_HANDLE_NONE) && s_input_notify_en && (s_input_val_handle != 0);
+    return (s_conn != BLE_HS_CONN_HANDLE_NONE) && s_input_notify_en_cc && (s_input_val_handle_cc != 0);
+}
+
+bool ble_hid_tel_is_ready(void) {
+    return (s_conn != BLE_HS_CONN_HANDLE_NONE) && s_input_notify_en_tel && (s_input_val_handle_tel != 0);
 }
 
 static void ensure_hid_worker_started(void)
@@ -117,6 +138,11 @@ static const struct ble_gatt_dsc_def s_input_descs[] = {
     { 0 }
 };
 
+static const struct ble_gatt_dsc_def s_input_descs_tel[] = {
+    { .uuid = &UUID_DSC_REPORT_REF.u, .att_flags = BLE_ATT_F_READ | BLE_ATT_F_READ_ENC, .access_cb = hid_access },
+    { 0 }
+};
+
 // NOTE: BLE_GATT_CHR_F_READ is REQUIRED to enable reading; F_READ_ENC adds encryption requirement
 static const struct ble_gatt_chr_def s_hid_chrs[] = {
     { // HID Information - must be first for iOS
@@ -128,10 +154,14 @@ static const struct ble_gatt_chr_def s_hid_chrs[] = {
     { // Protocol Mode - iOS requires encryption for writes
       .uuid = &UUID_HID_PROTO_MODE.u, .access_cb = hid_access,
       .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC },
-    { // Input Report (value handle stored for notify)
+    { // Input Report (Consumer Control)
       .uuid = &UUID_HID_REPORT.u,     .access_cb = hid_access,
       .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
-      .val_handle = &s_input_val_handle, .descriptors = s_input_descs },
+      .val_handle = &s_input_val_handle_cc, .descriptors = s_input_descs },
+    { // Input Report (Telephony)
+      .uuid = &UUID_HID_REPORT.u,     .access_cb = hid_access,
+      .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
+      .val_handle = &s_input_val_handle_tel, .descriptors = s_input_descs_tel },
     { // Control Point - iOS requires encrypted write
       .uuid = &UUID_HID_CTRL_POINT.u, .access_cb = hid_access,
       .flags = BLE_GATT_CHR_F_WRITE_NO_RSP | BLE_GATT_CHR_F_WRITE_ENC },
@@ -155,7 +185,11 @@ static int hid_access(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt 
 
         // Report Reference
         if (ble_uuid_cmp(du, &UUID_DSC_REPORT_REF.u) == 0) {
-            return os_mbuf_append(ctxt->om, s_report_ref, sizeof s_report_ref) == 0
+            if (attr == s_input_val_handle_tel + 1) {
+                return os_mbuf_append(ctxt->om, s_report_ref_tel, sizeof s_report_ref_tel) == 0
+                     ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+            }
+            return os_mbuf_append(ctxt->om, s_report_ref_cc, sizeof s_report_ref_cc) == 0
                  ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
         }
 
@@ -232,27 +266,32 @@ esp_err_t ble_hid_init(void)
 // Resolve handles after ble_gatts_start() (called from your on_sync)
 esp_err_t ble_hid_get_handles(void)
 {
-    if (s_input_val_handle == 0) {
+    if (s_input_val_handle_cc == 0 || s_input_val_handle_tel == 0) {
         ESP_LOGE(TAG, "Input report handle unresolved");
         return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "HID Input val handle=0x%04x", s_input_val_handle);
+    ESP_LOGI(TAG, "HID Input CC handle=0x%04x", s_input_val_handle_cc);
+    ESP_LOGI(TAG, "HID Input TEL handle=0x%04x", s_input_val_handle_tel);
     return ESP_OK;
 }
 
 void ble_hid_set_conn(uint16_t conn_hdl) { 
     s_conn = conn_hdl; 
     if (conn_hdl == BLE_HS_CONN_HANDLE_NONE) {
-        s_input_notify_en = false;  // Reset notify state on disconnect
+        s_input_notify_en_cc = false;  // Reset notify state on disconnect
+        s_input_notify_en_tel = false;
     }
 }
 
 // Map GAP SUBSCRIBE event to local notify flag (NimBLE gives value handle)
 void ble_hid_check_cccd_subscribe(uint16_t attr_handle, uint16_t cur_notify)
 {
-    if (attr_handle == s_input_val_handle) {
-        s_input_notify_en = (cur_notify != 0);
-        ESP_LOGI(TAG, "Input notify %s", s_input_notify_en ? "ENABLED" : "DISABLED");
+    if (attr_handle == s_input_val_handle_cc) {
+        s_input_notify_en_cc = (cur_notify != 0);
+        ESP_LOGI(TAG, "Input CC notify %s", s_input_notify_en_cc ? "ENABLED" : "DISABLED");
+    } else if (attr_handle == s_input_val_handle_tel) {
+        s_input_notify_en_tel = (cur_notify != 0);
+        ESP_LOGI(TAG, "Input TEL notify %s", s_input_notify_en_tel ? "ENABLED" : "DISABLED");
     }
 }
 
@@ -264,7 +303,7 @@ static esp_err_t send_bits_immediate(uint8_t v)
     // Press
     struct os_mbuf *om = ble_hs_mbuf_from_flat(&v, 1);
     if (!om) return ESP_ERR_NO_MEM;
-    int rc = ble_gatts_notify_custom(s_conn, s_input_val_handle, om);
+    int rc = ble_gatts_notify_custom(s_conn, s_input_val_handle_cc, om);
     if (rc) return ESP_FAIL;
 
     vTaskDelay(pdMS_TO_TICKS(60));
@@ -273,7 +312,26 @@ static esp_err_t send_bits_immediate(uint8_t v)
     v = 0x00;
     om = ble_hs_mbuf_from_flat(&v, 1);
     if (!om) return ESP_ERR_NO_MEM;
-    rc = ble_gatts_notify_custom(s_conn, s_input_val_handle, om);
+    rc = ble_gatts_notify_custom(s_conn, s_input_val_handle_cc, om);
+    return rc ? ESP_FAIL : ESP_OK;
+}
+
+static esp_err_t send_bits_immediate_tel(uint8_t v)
+{
+    if (!ble_hid_tel_is_ready()) return ESP_ERR_INVALID_STATE;
+
+    uint8_t payload[2] = { 0x04, v };
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(payload, sizeof(payload));
+    if (!om) return ESP_ERR_NO_MEM;
+    int rc = ble_gatts_notify_custom(s_conn, s_input_val_handle_tel, om);
+    if (rc) return ESP_FAIL;
+
+    v = 0x00;
+    payload[0] = 0x04;
+    payload[1] = v;
+    om = ble_hs_mbuf_from_flat(payload, sizeof(payload));
+    if (!om) return ESP_ERR_NO_MEM;
+    rc = ble_gatts_notify_custom(s_conn, s_input_val_handle_tel, om);
     return rc ? ESP_FAIL : ESP_OK;
 }
 
@@ -282,6 +340,13 @@ static esp_err_t cc_tap_bit_immediate(uint8_t bit_index)
     if (bit_index > 6) return ESP_ERR_INVALID_ARG;
     uint8_t v = (uint8_t)(1u << bit_index);
     return send_bits_immediate(v);
+}
+
+static esp_err_t tel_tap_bit_immediate(uint8_t bit_index)
+{
+    if (bit_index > 0) return ESP_ERR_INVALID_ARG;
+    uint8_t v = (uint8_t)(1u << bit_index);
+    return send_bits_immediate_tel(v);
 }
 
 // ---------- Worker task (serializes and guards timing) ----------
@@ -301,6 +366,8 @@ static void hid_worker(void *arg)
 
             if (act.type == HID_ACT_BITIDX) {
                 (void)cc_tap_bit_immediate(act.bitidx);
+            } else if (act.type == HID_ACT_TEL_BITIDX) {
+                (void)tel_tap_bit_immediate(act.bitidx);
             } else {
                 uint8_t v = (uint8_t)(act.bits & 0x7F); // lower 7 bits valid
                 (void)send_bits_immediate(v);
@@ -336,6 +403,13 @@ static esp_err_t enqueue_bit(uint8_t idx)
     return xQueueSend(s_hid_q, &a, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
 }
 
+static esp_err_t enqueue_tel_bit(uint8_t idx)
+{
+    if (!s_hid_q) return ESP_ERR_INVALID_STATE;
+    hid_act_t a = { .type = HID_ACT_TEL_BITIDX, .bits = 0, .bitidx = idx };
+    return xQueueSend(s_hid_q, &a, 0) == pdTRUE ? ESP_OK : ESP_FAIL;
+}
+
 esp_err_t ble_hid_cc_tap_vol_up(void)      { return enqueue_bit(BIT_VOL_UP); }
 esp_err_t ble_hid_cc_tap_vol_down(void)    { return enqueue_bit(BIT_VOL_DOWN); }
 esp_err_t ble_hid_cc_tap_mute(void)        { return enqueue_bit(BIT_MUTE); }
@@ -343,3 +417,4 @@ esp_err_t ble_hid_cc_tap_play_pause(void)  { return enqueue_bit(BIT_PLAY_PAUSE);
 esp_err_t ble_hid_cc_tap_next(void)        { return enqueue_bit(BIT_NEXT); }
 esp_err_t ble_hid_cc_tap_prev(void)        { return enqueue_bit(BIT_PREV); }
 esp_err_t ble_hid_cc_tap_stop(void)        { return enqueue_bit(BIT_STOP); }
+esp_err_t ble_hid_tel_tap_hook_switch(void){ return enqueue_tel_bit(0); }

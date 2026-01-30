@@ -520,6 +520,8 @@ void hand_gesture_ml_process_frame(camera_fb_t *fb)
         esp_err_t rc = ESP_OK;
         if (action == HAND_ACTION_HID_STOP_PAUSE) {
             rc = ble_hid_cc_tap_play_pause();
+            // Also attempt call reject (Hook Switch) for iOS
+            (void)ble_hid_tel_tap_hook_switch();
             ESP_LOGI(TAG, "Gesture: two -> play/pause");
         } else if (action == HAND_ACTION_HID_NEXT) {
             rc = ble_hid_cc_tap_next();
