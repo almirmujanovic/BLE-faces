@@ -46,11 +46,14 @@ void ble_img_xfer_on_disconnect(void);
 void ble_img_xfer_on_subscribe(uint16_t attr_handle, bool notify_enabled);
 void ble_img_xfer_on_notify_tx(void);               // resume sending when TX frees
 void ble_img_xfer_resolve_handles(void);
-// Send one frame (metadata + chunked payload) 
+// Send one frame (metadata + chunked payload).
+// Ownership: on success, the transfer takes ownership of `data` and will free it.
+//            `data` must be heap-allocated (PSRAM ok) and must not be freed by caller.
+//            On failure, the caller retains ownership.
 bool ble_img_xfer_send_frame(const ble_img_info_t *info,
                              const uint8_t *data, uint32_t len);
 
-// Convenience for RGB565 crops
+// Convenience for RGB565 crops (same ownership rules as ble_img_xfer_send_frame)
 bool ble_img_xfer_send_rgb565(uint32_t frame_id,
                               uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                               const uint8_t *rgb565, uint32_t len);

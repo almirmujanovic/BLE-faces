@@ -275,9 +275,8 @@ void process_face_crop_and_send(uint32_t frame_id, uint16_t x, uint16_t y,
             ESP_LOGI("IMG_PROC", "Successfully queued crop for BLE transfer");
         } else {
             ESP_LOGW("IMG_PROC", "Failed to queue crop for BLE transfer");
+            heap_caps_free(crop_buf); // Free PSRAM crop buffer on failure
         }
-        
-        heap_caps_free(crop_buf); // Free PSRAM crop buffer
     } else {
         ESP_LOGE("IMG_PROC", "Failed to create crop from %dx%d at (%d,%d)", 
                  w, h, x, y);

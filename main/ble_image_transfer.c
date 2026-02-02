@@ -26,10 +26,13 @@ static QueueHandle_t pump_queue = NULL;
 
 // Transfer state structure
 typedef struct {
-    uint8_t *data_copy;      // Internal RAM copy for BLE operations
+    uint8_t *data_psram;     // Source buffer (PSRAM) owned by transfer
+    uint8_t *scratch;        // Small internal RAM scratch for chunking
+    uint32_t scratch_len;
     uint32_t total_len;
     uint32_t sent;
     bool active;
+    bool owns_data;
 } transfer_state_t;
 
 static transfer_state_t g_transfer = {0};
@@ -172,17 +175,26 @@ static int img_data_access(uint16_t conn_handle, uint16_t attr_handle,
     return BLE_ATT_ERR_UNLIKELY;
 }
 
-//Transfer cleanup
+// Transfer cleanup
 static void cleanup_transfer(void)
 {
-    if (g_transfer.data_copy) {
-        ESP_LOGD(TAG, "Freeing transfer buffer");
-        free(g_transfer.data_copy);  // Internal RAM buffer
-        g_transfer.data_copy = NULL;
+    if (g_transfer.data_psram) {
+        ESP_LOGD(TAG, "Freeing transfer source buffer");
+        if (g_transfer.owns_data) {
+            heap_caps_free(g_transfer.data_psram);  // PSRAM buffer
+        }
+        g_transfer.data_psram = NULL;
+    }
+    if (g_transfer.scratch) {
+        ESP_LOGD(TAG, "Freeing transfer scratch buffer");
+        heap_caps_free(g_transfer.scratch);  // Internal RAM scratch
+        g_transfer.scratch = NULL;
+        g_transfer.scratch_len = 0;
     }
     g_transfer.total_len = 0;
     g_transfer.sent = 0;
     g_transfer.active = false;
+    g_transfer.owns_data = false;
 }
 
 // Pump task (runs in separate task context, not BLE callback)
@@ -197,11 +209,12 @@ static void pump_task(void *pvParameters)
             switch (msg.cmd) {
                 case PUMP_START:
                     ESP_LOGD(TAG, "Starting pump with %lu bytes", msg.len);
-                    // Data is already copied to internal RAM, just update state
-                    g_transfer.data_copy = msg.data;
+                    // Data lives in PSRAM; we'll copy chunks into internal scratch as we go.
+                    g_transfer.data_psram = msg.data;
                     g_transfer.total_len = msg.len;
                     g_transfer.sent = 0;
                     g_transfer.active = true;
+                    g_transfer.owns_data = true;
                     // Fall through to start pumping
                     
                 case PUMP_CONTINUE:
@@ -212,6 +225,28 @@ static void pump_task(void *pvParameters)
                     // Calculate chunk size
                     int mtu = ble_att_mtu(g_conn);
                     int chunk_size = (mtu > 23) ? (mtu - 3) : 20;
+
+                    // Ensure scratch buffer is large enough
+                    if (!g_transfer.scratch || g_transfer.scratch_len < (uint32_t)chunk_size) {
+                        size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+                        size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+                        ESP_LOGI(TAG, "Internal RAM before scratch alloc: free=%u, largest=%u, need=%u",
+                                 (unsigned)internal_free, (unsigned)internal_largest, (unsigned)chunk_size);
+
+                        if (g_transfer.scratch) {
+                            heap_caps_free(g_transfer.scratch);
+                            g_transfer.scratch = NULL;
+                            g_transfer.scratch_len = 0;
+                        }
+                        g_transfer.scratch = (uint8_t *)heap_caps_malloc((size_t)chunk_size,
+                                                                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+                        if (!g_transfer.scratch) {
+                            ESP_LOGE(TAG, "Failed to allocate internal scratch buffer (%d bytes)", chunk_size);
+                            cleanup_transfer();
+                            break;
+                        }
+                        g_transfer.scratch_len = (uint32_t)chunk_size;
+                    }
                     
                     uint32_t remaining = g_transfer.total_len - g_transfer.sent;
                     if (remaining == 0) {
@@ -222,8 +257,9 @@ static void pump_task(void *pvParameters)
                     
                     uint32_t to_send = (remaining > chunk_size) ? chunk_size : remaining;
                     
-                    // Create mbuf from internal RAM data (safe)
-                    struct os_mbuf *om = ble_hs_mbuf_from_flat(g_transfer.data_copy + g_transfer.sent, to_send);
+                    // Copy from PSRAM into internal scratch, then create mbuf from scratch
+                    memcpy(g_transfer.scratch, g_transfer.data_psram + g_transfer.sent, to_send);
+                    struct os_mbuf *om = ble_hs_mbuf_from_flat(g_transfer.scratch, to_send);
                     if (!om) {
                         ESP_LOGE(TAG, "Failed to allocate mbuf");
                         cleanup_transfer();
@@ -348,22 +384,10 @@ bool ble_img_xfer_send_frame(const ble_img_info_t *info,
     
     ESP_LOGI(TAG, "Sending frame: %dx%d, %lu bytes", info->width, info->height, len);
     
-    // Copy data to internal RAM for safe BLE access
-    uint8_t *internal_copy = (uint8_t*)malloc(len);
-    if (!internal_copy) {
-        ESP_LOGE(TAG, "Failed to allocate internal RAM buffer (%lu bytes)", len);
-        return false;
-    }
-    
-    // Copy from PSRAM to internal RAM
-    memcpy(internal_copy, data, len);
-    ESP_LOGD(TAG, "Copied %lu bytes from PSRAM to internal RAM", len);
-    
     // Send INFO notification
     struct os_mbuf *om = ble_hs_mbuf_from_flat(info, sizeof(ble_img_info_t));
     if (!om) {
         ESP_LOGE(TAG, "Failed to allocate INFO mbuf");
-        free(internal_copy);
         return false;
     }
     
@@ -371,25 +395,23 @@ bool ble_img_xfer_send_frame(const ble_img_info_t *info,
     if (rc != 0) {
         ESP_LOGE(TAG, "Failed to send INFO: %d", rc);
         os_mbuf_free_chain(om);
-        free(internal_copy);
         return false;
     }
     
-    // Start pumping via task
+    // Start pumping via task (transfer takes ownership on success)
     if (pump_queue) {
         pump_msg_t msg = { 
             .cmd = PUMP_START, 
-            .data = internal_copy, 
+            .data = (uint8_t *)data, 
             .len = len 
         };
         if (xQueueSend(pump_queue, &msg, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGE(TAG, "Failed to queue pump start");
-            free(internal_copy);
+            // Transfer didn't start; caller still owns data
             return false;
         }
     } else {
         ESP_LOGE(TAG, "Pump queue not initialized");
-        free(internal_copy);
         return false;
     }
     
