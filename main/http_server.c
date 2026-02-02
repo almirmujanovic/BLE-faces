@@ -16,6 +16,7 @@ static const char *TAG = "HTTP_SERVER";
 #define ITEM_HTML_MAX 512
 #define CONTENT_DISP_MAX 256
 #define CONTENT_DISP_NAME_MAX 200
+#define JSON_LINK_MAX 320
 
 // HTML header/footer for consistent styling
 static const char *html_header = 
@@ -45,6 +46,42 @@ static const char *html_header =
     "</head><body>";
 
 static const char *html_footer = "</body></html>";
+
+static void json_escape(const char *in, char *out, size_t out_len)
+{
+    size_t j = 0;
+    for (size_t i = 0; in[i] != '\0' && j + 2 < out_len; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '\"' || c == '\\') {
+            out[j++] = '\\';
+            out[j++] = (char)c;
+        } else if (c == '\b') {
+            out[j++] = '\\';
+            out[j++] = 'b';
+        } else if (c == '\f') {
+            out[j++] = '\\';
+            out[j++] = 'f';
+        } else if (c == '\n') {
+            out[j++] = '\\';
+            out[j++] = 'n';
+        } else if (c == '\r') {
+            out[j++] = '\\';
+            out[j++] = 'r';
+        } else if (c == '\t') {
+            out[j++] = '\\';
+            out[j++] = 't';
+        } else if (c < 0x20) {
+            if (j + 6 >= out_len) {
+                break;
+            }
+            snprintf(out + j, out_len - j, "\\u%04x", c);
+            j += 6;
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    out[j] = '\0';
+}
 
 // Helper: Get storage info
 static void get_storage_info(size_t *total, size_t *used, size_t *free, float *percent)
@@ -311,6 +348,93 @@ static esp_err_t videos_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_media_handler(httpd_req_t *req)
+{
+    if (!media_lock_spiffs(2000)) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Storage busy, try again later");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr_chunk(req, "{\"images\":[");
+
+    bool first_img = true;
+    bool first_vid = true;
+
+    DIR *dir = opendir(MEDIA_MOUNT_POINT);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type != DT_REG) {
+                continue;
+            }
+
+            bool is_image = (strstr(entry->d_name, ".jpg") || strstr(entry->d_name, ".jpeg"));
+            if (!is_image) {
+                continue;
+            }
+
+            char link_raw[MEDIA_PATH_MAX];
+            snprintf(link_raw, sizeof(link_raw), "/download?file=%.*s",
+                     MEDIA_NAME_MAX, entry->d_name);
+
+            char link_json[JSON_LINK_MAX];
+            json_escape(link_raw, link_json, sizeof(link_json));
+
+            if (is_image) {
+                if (!first_img) {
+                    httpd_resp_sendstr_chunk(req, ",");
+                }
+                httpd_resp_sendstr_chunk(req, "\"");
+                httpd_resp_sendstr_chunk(req, link_json);
+                httpd_resp_sendstr_chunk(req, "\"");
+                first_img = false;
+            }
+        }
+        closedir(dir);
+    }
+
+    httpd_resp_sendstr_chunk(req, "],\"videos\":[");
+
+    dir = opendir(MEDIA_MOUNT_POINT);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (entry->d_type != DT_REG) {
+                continue;
+            }
+
+            bool is_video = (strstr(entry->d_name, ".avi") || strstr(entry->d_name, ".mjpg"));
+            if (!is_video) {
+                continue;
+            }
+
+            char link_raw[MEDIA_PATH_MAX];
+            snprintf(link_raw, sizeof(link_raw), "/download?file=%.*s",
+                     MEDIA_NAME_MAX, entry->d_name);
+
+            char link_json[JSON_LINK_MAX];
+            json_escape(link_raw, link_json, sizeof(link_json));
+
+            if (!first_vid) {
+                httpd_resp_sendstr_chunk(req, ",");
+            }
+            httpd_resp_sendstr_chunk(req, "\"");
+            httpd_resp_sendstr_chunk(req, link_json);
+            httpd_resp_sendstr_chunk(req, "\"");
+            first_vid = false;
+        }
+        closedir(dir);
+    }
+
+    httpd_resp_sendstr_chunk(req, "]}");
+    httpd_resp_sendstr_chunk(req, NULL);
+
+    media_unlock_spiffs();
+    return ESP_OK;
+}
+
 // Download/view file
 static esp_err_t download_handler(httpd_req_t *req)
 {
@@ -388,7 +512,7 @@ httpd_handle_t start_http_server(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
-    config.max_uri_handlers = 6;
+    config.max_uri_handlers = 7;
     config.max_open_sockets = 4;
     config.stack_size = 4096;  // keep in internal RAM (SPIFFS reads disable cache)
     config.task_priority = 5;  // Lower priority to avoid mutex conflicts
@@ -455,6 +579,14 @@ httpd_handle_t start_http_server(void)
             .handler = download_handler
         };
         httpd_register_uri_handler(server, &download);
+
+        // JSON API for media links
+        httpd_uri_t api_media = {
+            .uri = "/api/media",
+            .method = HTTP_GET,
+            .handler = api_media_handler
+        };
+        httpd_register_uri_handler(server, &api_media);
         
         ESP_LOGI(TAG, "HTTP server started on core %d with priority %d",
                  config.core_id, config.task_priority);
